@@ -443,5 +443,5 @@ Total working data: well under 500 rows. Highly efficient to query and maintain.
 
 ---
 
-*Design by: Gramercy Engineering | 2026-05-05*
+*Design by: Capstone Group | 2026-05-05*
 *Status: Approved for implementation*

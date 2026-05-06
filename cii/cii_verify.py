@@ -77,21 +77,27 @@ def check_sc_gap(conn):
 
 
 if __name__ == "__main__":
-    conn = get_conn()
+    try:
+        conn = get_conn()
+    except Exception as exc:
+        print(f"  ✗ Cannot connect to database — {exc}")
+        sys.exit(1)
     print("\nCII Post-Run Verification")
     print("=" * 50)
     all_pass = True
-    for label, fn in CHECKS:
-        try:
-            passed, msg = fn(conn)
-            status = "✓" if passed else "✗"
-            print(f"  {status} {label}")
-            if not passed:
-                print(f"      → {msg}")
+    try:
+        for label, fn in CHECKS:
+            try:
+                passed, msg = fn(conn)
+                status = "✓" if passed else "✗"
+                print(f"  {status} {label}")
+                if not passed:
+                    print(f"      → {msg}")
+                    all_pass = False
+            except Exception as exc:
+                print(f"  ✗ {label} — ERROR: {exc}")
                 all_pass = False
-        except Exception as exc:
-            print(f"  ✗ {label} — ERROR: {exc}")
-            all_pass = False
-    conn.close()
+    finally:
+        conn.close()
     print()
     sys.exit(0 if all_pass else 1)

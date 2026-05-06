@@ -1,20 +1,10 @@
 import calendar
-import os
 from datetime import date
-import psycopg2
 from dotenv import load_dotenv
-from cii_collectors import COUNTRIES, get_conn
+from cii_collectors import COUNTRIES
 from cii_si3_collectors import upsert_raw_metric
 
 load_dotenv()
-
-SDI_DB_CONFIG = {
-    "host":     os.environ.get("POSTGRES_HOST", "localhost"),
-    "port":     int(os.environ.get("POSTGRES_PORT", 5433)),
-    "dbname":   "csi_scores",
-    "user":     os.environ.get("POSTGRES_USER", ""),
-    "password": os.environ.get("POSTGRES_PASSWORD", ""),
-}
 
 
 def _quarter_label(d: date) -> str:
@@ -33,9 +23,8 @@ def _compute_si2_snapshot(conn, country_iso: str, quarter: str,
     """Aggregate facilities into a quarterly snapshot; compute QoQ rates."""
     with conn.cursor() as cur:
         # Current quarter aggregates
-        q_start = date(quarter_end.year,
-                       ((quarter_end.month - 4) % 12) + 1,
-                       1)
+        q = (quarter_end.month - 1) // 3
+        q_start = date(quarter_end.year, [1, 4, 7, 10][q], 1)
         cur.execute("""
             SELECT
                 COALESCE(SUM(CASE WHEN status='operational' THEN capacity_mw ELSE 0 END), 0),
@@ -79,7 +68,7 @@ def _compute_si2_snapshot(conn, country_iso: str, quarter: str,
         grid_mw = grid_row[0] if grid_row else None
 
     def qoq(curr, prev_val):
-        if prev is None or prev_val is None or prev_val == 0:
+        if prev_val is None or prev_val == 0:
             return None
         return round((curr - prev_val) / prev_val, 6)
 

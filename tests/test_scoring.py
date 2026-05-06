@@ -66,7 +66,9 @@ def test_compute_si2_snapshot_null_on_no_prev_quarter():
     assert snap["qoq_committed_mw_growth_rate"] is None
 
 
-def test_compute_si3_derived_writes_hyperscaler_count(mock_conn):
+def test_compute_si3_derived_writes_hyperscaler_count():
+    mock_conn = MagicMock()
+    # fetchone returns data for both queries (hyperscaler count/invest + chip_access_tier)
     mock_conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (7, 5_000_000_000.0)
     with patch("cii_scoring.upsert_raw_metric") as mock_upsert:
         from cii_scoring import compute_si3_derived
@@ -74,3 +76,4 @@ def test_compute_si3_derived_writes_hyperscaler_count(mock_conn):
         calls = {c[0][4] for c in mock_upsert.call_args_list}  # metric_key is 5th positional arg
         assert "hyperscaler_count" in calls
         assert "hyperscaler_investment_usd" in calls
+        assert "chip_access_tier" in calls

@@ -234,7 +234,6 @@ def run_scoring(conn, run_id: str) -> None:
     today = date.today()
 
     raw: dict[tuple, float] = {}
-    confidence: dict[tuple, float] = {}
     with conn.cursor() as cur:
         cur.execute("""
             SELECT country_iso, metric_key, metric_value, confidence_score
@@ -244,9 +243,8 @@ def run_scoring(conn, run_id: str) -> None:
                 FROM cii_raw_metrics GROUP BY country_iso, metric_key
             )
         """)
-        for c_iso, mk, val, conf in cur.fetchall():
+        for c_iso, mk, val, _ in cur.fetchall():
             raw[(c_iso, mk)] = val
-            confidence[(c_iso, mk)] = conf
 
     subindex_scores: dict[str, dict[str, float]] = {si: {} for si in ("SI1", "SI2", "SI3")}
 
@@ -329,10 +327,12 @@ def compute_sc_gap(conn, run_id: str) -> None:
 
     try:
         sdi_conn = psycopg2.connect(**SDI_DB_CONFIG)
-        with sdi_conn.cursor() as cur:
-            cur.execute("SELECT country_iso, sdi_score FROM score_sdi")
-            sdi_rows = dict(cur.fetchall())
-        sdi_conn.close()
+        try:
+            with sdi_conn.cursor() as cur:
+                cur.execute("SELECT country_iso, sdi_score FROM score_sdi")
+                sdi_rows = dict(cur.fetchall())
+        finally:
+            sdi_conn.close()
     except Exception:
         sdi_rows = {}
 

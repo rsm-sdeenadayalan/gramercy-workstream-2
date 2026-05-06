@@ -1,6 +1,5 @@
 import pytest
 from unittest.mock import MagicMock, patch
-import psycopg2
 
 
 @pytest.fixture
@@ -47,4 +46,7 @@ def sample_facility():
         "confidence_score": 0.85,
         "source_urls": ["https://news.microsoft.com/iowa"],
         "source_count": 2,
+        "has_estimated_fields": False,
+        "first_seen_run_id": None,
+        "last_updated_run_id": None,
     }

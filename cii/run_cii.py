@@ -10,7 +10,7 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(__file__))
 
 from cii_collectors import (
-    get_conn, COUNTRIES, log_attempt,
+    get_conn, COUNTRIES,
     run_discovery_pass, run_enrichment_pass, run_validation_pass,
 )
 from cii_si3_collectors import collect_domestic_ownership, collect_frontier_training
@@ -23,7 +23,7 @@ from cii_gap_report import build_gap_report, print_gap_report
 TAVILY_MONTHLY_BUDGET = 900   # warn at 90% of 1000 free tier
 
 
-def _check_tavily_quota(conn, run_id: str) -> bool:
+def _check_tavily_quota(conn) -> bool:
     with conn.cursor() as cur:
         cur.execute("SELECT COALESCE(SUM(tavily_calls_used), 0) FROM cii_collection_runs "
                     "WHERE started_at >= date_trunc('month', NOW())")
@@ -67,6 +67,13 @@ def main(only: str = None):
     run_id = str(uuid.uuid4())
     conn = get_conn()
 
+    if only == "gap":
+        try:
+            print_gap_report(build_gap_report(conn))
+        finally:
+            conn.close()
+        return
+
     # Register run
     with conn.cursor() as cur:
         cur.execute("""
@@ -81,8 +88,15 @@ def main(only: str = None):
         if only in (None, "si1", "si3"):
             # ── Phase 1: SI1 + SI3 research in parallel ──────────────────────
             print("\n── Phase 1: SI1 facility collection + SI3 research (parallel) ──")
-            if not _check_tavily_quota(conn, run_id):
+            if not _check_tavily_quota(conn):
                 print("  Aborting: Tavily quota exhausted.")
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE cii_collection_runs SET status='failed', "
+                        "finished_at=NOW(), notes='Aborted: Tavily quota exhausted' "
+                        "WHERE run_id=%s", (run_id,)
+                    )
+                conn.commit()
                 return
 
             tasks = (
@@ -92,8 +106,15 @@ def main(only: str = None):
             with ThreadPoolExecutor(max_workers=4) as pool:
                 futures = {pool.submit(fn, *args): f"{fn.__name__}-{args[-1]}"
                            for fn, *args in tasks}
+                results = []
                 for fut in as_completed(futures):
-                    print(f"  ✓ {futures[fut]}: {fut.result()}")
+                    result = fut.result()
+                    results.append(result)
+                    status_mark = "✗" if "FAILED" in result else "✓"
+                    print(f"  {status_mark} {futures[fut]}: {result}")
+                failed = [r for r in results if "FAILED" in r]
+                if failed:
+                    print(f"\n  ⚠ {len(failed)} worker(s) failed in Phase 1 — proceeding with partial data")
 
         if only in (None, "si2", "scoring"):
             # ── Phase 2: SI2 + SI3 derived (sequential, needs SI1 data) ─────

@@ -1,6 +1,5 @@
 # tests/test_gap_report.py
-import pytest, sys, os
-from unittest.mock import MagicMock
+import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'cii'))
 
 

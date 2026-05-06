@@ -1,4 +1,3 @@
-import os
 from dotenv import load_dotenv
 from cii_collectors import get_conn
 
@@ -9,14 +8,7 @@ def build_gap_report(conn) -> dict:
     """Query cii_data_gaps and return prioritised sections."""
     report = {"critical": [], "high": [], "medium": [], "structural": []}
 
-    severity_map = {
-        "critical":   "critical",
-        "high":       "high",
-        "medium":     "medium",
-        "structural": "structural",
-    }
-
-    for sev, key in severity_map.items():
+    for sev in ("critical", "high", "medium", "structural"):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT country_iso, metric_key, facility_name, failure_reason,
@@ -26,7 +18,7 @@ def build_gap_report(conn) -> dict:
                 ORDER BY attempt_count DESC, country_iso
             """, (sev,))
             for row in cur.fetchall():
-                report[key].append({
+                report[sev].append({
                     "country_iso":            row[0],
                     "metric_key":             row[1],
                     "facility_name":          row[2],

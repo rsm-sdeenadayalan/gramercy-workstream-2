@@ -1,8 +1,10 @@
-import os, sys
+import os
 import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 DB_CONFIG = {
     "host":     os.environ.get("POSTGRES_HOST", "localhost"),
@@ -15,26 +17,30 @@ DB_CONFIG = {
 def create_db_if_not_exists(host, port, user, password):
     conn = psycopg2.connect(host=host, port=port, user=user,
                             password=password, dbname="postgres")
-    conn.autocommit = True
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM pg_database WHERE datname = 'cii'")
-        if cur.fetchone() is None:
-            cur.execute('CREATE DATABASE cii')
-            print("  Created database: cii")
-        else:
-            print("  Database cii already exists — skipping create")
-    conn.close()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = 'cii'")
+            if cur.fetchone() is None:
+                cur.execute('CREATE DATABASE cii')
+                print("  Created database: cii")
+            else:
+                print("  Database cii already exists — skipping create")
+    finally:
+        conn.close()
 
 
 def apply_schema(host, port, user, password):
-    schema_path = os.path.join(os.path.dirname(__file__), "cii_schema.sql")
+    schema_path = os.path.join(_HERE, "cii_schema.sql")
     conn = psycopg2.connect(host=host, port=port, user=user,
                             password=password, dbname="cii")
-    conn.autocommit = True
-    with conn.cursor() as cur:
-        with open(schema_path) as f:
-            cur.execute(f.read())
-    conn.close()
+    try:
+        conn.autocommit = True  # schema SQL has explicit BEGIN/COMMIT; autocommit required
+        with conn.cursor() as cur:
+            with open(schema_path) as f:
+                cur.execute(f.read())
+    finally:
+        conn.close()
     print("  Schema applied.")
 
 

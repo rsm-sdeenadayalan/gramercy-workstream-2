@@ -6,7 +6,8 @@ from unittest.mock import MagicMock, patch
 def mock_conn():
     conn = MagicMock()
     cursor = MagicMock()
-    cursor.__enter__ = lambda s: s
+    enter_mock = MagicMock(return_value=cursor)
+    cursor.__enter__ = enter_mock
     cursor.__exit__ = MagicMock(return_value=False)
     conn.cursor.return_value = cursor
     return conn

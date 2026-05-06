@@ -257,3 +257,154 @@ def run_discovery_pass(conn, run_id: str, country_iso: str) -> int:
         """, (found, len(DISCOVERY_QUERY_TEMPLATES), run_id))
     conn.commit()
     return found
+
+
+ENRICH_QUERY_TEMPLATES = [
+    '"{facility_name}" {operator} data center capacity megawatt MW',
+    '"{facility_name}" {operator} investment USD billion cost',
+    '"{facility_name}" {operator} operational date commissioned opened',
+]
+
+
+def _enrich_facility_claude(client, results: list[dict], facility: dict) -> dict:
+    if not results:
+        return {}
+    content_block = "\n\n".join(
+        f"Source: {r['url']}\nContent: {r['content'][:600]}"
+        for r in results if r.get("content")
+    )
+    if not content_block.strip():
+        return {}
+    prompt = f"""Extract details for the data center "{facility['facility_name']}" operated by "{facility['operator']}".
+Return a JSON object with these keys (use null if unknown):
+  capacity_mw (number), investment_value_usd (number in USD),
+  date_announced (YYYY-MM-DD), date_operational (YYYY-MM-DD),
+  energy_source (string), chip_type_if_known (string),
+  confidence_score (0.65-0.90 based on source quality), source_url (string)
+
+Sources:
+{content_block}
+
+Return ONLY the JSON object."""
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = resp.content[0].text.strip()
+        match = re.search(r"```[a-zA-Z]*\n?(.*?)```", text, re.DOTALL)
+        text = match.group(1).strip() if match else text
+        return json.loads(text)
+    except Exception:
+        return {}
+
+
+def run_enrichment_pass(conn, run_id: str, country_iso: str) -> int:
+    """Pass 2: deep-dive each facility to fill in MW, investment, dates.
+    Returns number of facilities enriched."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    enriched = 0
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT country_iso, facility_name, operator, capacity_mw
+            FROM cii_facilities
+            WHERE country_iso = %s
+            ORDER BY facility_name
+        """, (country_iso,))
+        facilities = cur.fetchall()
+
+    for (c_iso, fname, operator, existing_mw) in facilities:
+        for template in ENRICH_QUERY_TEMPLATES:
+            query = template.format(facility_name=fname, operator=operator)
+            t0 = time.perf_counter()
+            src_url = None
+            try:
+                results = web_search(query, count=3)
+                enriched_data = _enrich_facility_claude(
+                    client, results, {"facility_name": fname, "operator": operator}
+                )
+                if enriched_data:
+                    src_url = enriched_data.pop("source_url", None)
+                    update = {
+                        "country_iso": c_iso, "facility_name": fname,
+                        "operator": operator,
+                        "status": "operational",
+                        "ownership_type": "unknown",
+                        "is_hyperscaler": any(op in operator for op in HYPERSCALER_OPERATORS),
+                        **enriched_data,
+                        "source_urls": [src_url] if src_url else [],
+                        "source_count": 1,
+                    }
+                    upsert_facility(conn, run_id, update)
+                    enriched += 1
+                elapsed = int((time.perf_counter() - t0) * 1000)
+                log_attempt(conn, run_id, c_iso, fname, "enrichment",
+                            query, src_url if enriched_data else None,
+                            "success" if enriched_data else "gap",
+                            enriched_data.get("confidence_score") if enriched_data else None,
+                            elapsed)
+            except Exception as exc:
+                elapsed = int((time.perf_counter() - t0) * 1000)
+                log_attempt(conn, run_id, c_iso, fname, "enrichment",
+                            query, None, "failed", None, elapsed, str(exc)[:500])
+            time.sleep(0.2)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE cii_collection_runs
+            SET facilities_enriched = facilities_enriched + %s,
+                tavily_calls_used   = tavily_calls_used + %s
+            WHERE run_id = %s
+        """, (enriched, len(facilities) * len(ENRICH_QUERY_TEMPLATES), run_id))
+    conn.commit()
+    return enriched
+
+
+def run_validation_pass(conn, run_id: str, country_iso: str) -> int:
+    """Pass 3: assign final confidence based on source agreement;
+    apply hyperscaler benchmark when MW still missing.
+    Returns number of facilities updated."""
+    updated = 0
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT country_iso, facility_name, operator, capacity_mw, source_count
+            FROM cii_facilities WHERE country_iso = %s
+        """, (country_iso,))
+        facilities = cur.fetchall()
+
+    for (c_iso, fname, operator, cap_mw, src_count) in facilities:
+        update = {"country_iso": c_iso, "facility_name": fname,
+                  "operator": operator, "status": "operational",
+                  "ownership_type": "unknown",
+                  "is_hyperscaler": any(op in operator for op in HYPERSCALER_OPERATORS),
+                  "source_urls": [], "source_count": 0}
+
+        if cap_mw is not None and src_count >= 2:
+            update["confidence_score"]     = CONFIDENCE["multi_source"]
+            update["has_estimated_fields"] = False
+        elif cap_mw is not None:
+            update["confidence_score"]     = CONFIDENCE["agent_single"]
+            update["has_estimated_fields"] = False
+        else:
+            # Apply benchmark estimate
+            benchmark = next(
+                (v for op, v in HYPERSCALER_BENCHMARK_MW.items() if op in operator),
+                HYPERSCALER_BENCHMARK_MW["default"]
+            )
+            update["capacity_mw"]          = benchmark
+            update["confidence_score"]     = CONFIDENCE["benchmark_est"]
+            update["has_estimated_fields"] = True
+            upsert_gap(conn, c_iso, "capacity_mw", fname,
+                       "field_gap", "capacity_mw not found after enrichment",
+                       "medium" if update["is_hyperscaler"] else "low")
+
+        upsert_facility(conn, run_id, update)
+        log_attempt(conn, run_id, c_iso, fname, "validation",
+                    None, None, "success", update["confidence_score"], 0)
+        updated += 1
+
+    conn.commit()
+    return updated

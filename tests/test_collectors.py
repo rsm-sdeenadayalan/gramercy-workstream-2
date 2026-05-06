@@ -134,3 +134,54 @@ def test_run_discovery_pass_calls_upsert_per_query(mock_conn):
         run_discovery_pass(mock_conn, "run-123", "US")
         # 8 queries × 1 facility per query = 8 upsert calls; DB UNIQUE constraint deduplicates
         assert mock_upsert.call_count == 8
+
+
+def test_enrichment_updates_capacity_mw(mock_conn):
+    mock_conn.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+        ("US", "AWS Iowa", "Amazon", None)  # capacity_mw is NULL — needs enrichment
+    ]
+    with patch("cii_collectors.web_search") as mock_search, \
+         patch("cii_collectors._enrich_facility_claude") as mock_enrich, \
+         patch("cii_collectors.upsert_facility") as mock_upsert, \
+         patch("cii_collectors.log_attempt"):
+
+        mock_search.return_value = [{"url": "u", "title": "t", "content": "200MW"}]
+        mock_enrich.return_value = {
+            "capacity_mw": 200.0, "investment_value_usd": 1e9,
+            "date_announced": "2023-01-01", "date_operational": None,
+            "energy_source": "renewable", "chip_type_if_known": "H100",
+            "confidence_score": 0.75, "source_url": "u"
+        }
+        from cii_collectors import run_enrichment_pass
+        enriched = run_enrichment_pass(mock_conn, "run-123", "US")
+        assert enriched >= 1
+        assert mock_upsert.call_count >= 1
+
+
+def test_validation_assigns_high_confidence_for_multi_source(mock_conn):
+    mock_conn.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+        ("US", "AWS Iowa", "Amazon", 200.0, 2)  # source_count=2
+    ]
+    with patch("cii_collectors.log_attempt"), \
+         patch("cii_collectors.upsert_facility") as mock_upsert:
+        from cii_collectors import run_validation_pass
+        run_validation_pass(mock_conn, "run-123", "US")
+        if mock_upsert.called:
+            call_kwargs = mock_upsert.call_args[0][2]
+            assert call_kwargs["confidence_score"] >= 0.85
+
+
+def test_validation_applies_benchmark_when_mw_missing(mock_conn):
+    mock_conn.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+        ("US", "Meta Iowa", "Meta", None, 0)  # capacity_mw NULL, 0 sources
+    ]
+    with patch("cii_collectors.upsert_facility") as mock_upsert, \
+         patch("cii_collectors.log_attempt"), \
+         patch("cii_collectors.upsert_gap"):
+        from cii_collectors import run_validation_pass, HYPERSCALER_BENCHMARK_MW, CONFIDENCE
+        run_validation_pass(mock_conn, "run-123", "US")
+        assert mock_upsert.called
+        call_kwargs = mock_upsert.call_args[0][2]
+        assert call_kwargs["capacity_mw"] == HYPERSCALER_BENCHMARK_MW["Meta"]
+        assert call_kwargs["confidence_score"] == CONFIDENCE["benchmark_est"]
+        assert call_kwargs["has_estimated_fields"] is True

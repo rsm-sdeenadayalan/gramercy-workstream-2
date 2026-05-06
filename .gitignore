@@ -1,0 +1,20 @@
+# Worktrees
+.worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Environment
+.env
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Cache
+fao_cache/

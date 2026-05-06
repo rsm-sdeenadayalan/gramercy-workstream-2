@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS cii_raw_metrics (
     metric_key       VARCHAR(100)     NOT NULL,
     metric_value     DOUBLE PRECISION,
     unit             VARCHAR(50),
-    data_date        DATE,
+    data_date        DATE             NOT NULL DEFAULT CURRENT_DATE,
     source_name      VARCHAR(200),
     source_url       TEXT,
     confidence_score DOUBLE PRECISION,
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS cii_subindex_weights (
 
 CREATE TABLE IF NOT EXISTS cii_score_metric_inputs (
     id           SERIAL PRIMARY KEY,
-    run_id       UUID,
+    run_id       UUID             NOT NULL,
     country_iso  CHAR(2)          NOT NULL,
     sub_index    VARCHAR(10)      NOT NULL,
     metric_key   VARCHAR(100)     NOT NULL,
@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS cii_score_metric_inputs (
 
 CREATE TABLE IF NOT EXISTS cii_score_metric_normalized (
     id             SERIAL PRIMARY KEY,
-    run_id         UUID,
+    run_id         UUID             NOT NULL,
     country_iso    CHAR(2)          NOT NULL,
     sub_index      VARCHAR(10)      NOT NULL,
     metric_key     VARCHAR(100)     NOT NULL,
@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS cii_score_metric_normalized (
 
 CREATE TABLE IF NOT EXISTS cii_score_subindex (
     id             SERIAL PRIMARY KEY,
-    run_id         UUID,
+    run_id         UUID             NOT NULL,
     country_iso    CHAR(2)          NOT NULL,
     sub_index      VARCHAR(10)      NOT NULL,
     score          DOUBLE PRECISION NOT NULL,
@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS cii_score_subindex (
 
 CREATE TABLE IF NOT EXISTS cii_score_final (
     id            SERIAL PRIMARY KEY,
-    run_id        UUID,
+    run_id        UUID             NOT NULL,
     country_iso   CHAR(2)          NOT NULL,
     si1_capacity  DOUBLE PRECISION,
     si2_velocity  DOUBLE PRECISION,
@@ -173,7 +173,7 @@ CREATE TABLE IF NOT EXISTS cii_score_final (
 
 CREATE TABLE IF NOT EXISTS cii_sc_gap (
     id               SERIAL PRIMARY KEY,
-    run_id           UUID,
+    run_id           UUID             NOT NULL,
     country_iso      CHAR(2)          NOT NULL,
     sdi_score        DOUBLE PRECISION,
     sdi_normalized   DOUBLE PRECISION,
@@ -233,9 +233,12 @@ CREATE TABLE IF NOT EXISTS cii_data_gaps (
     first_detected          TIMESTAMP DEFAULT NOW(),
     last_attempted          TIMESTAMP DEFAULT NOW(),
     attempt_count           INTEGER DEFAULT 1,
-    status                  VARCHAR(20) DEFAULT 'open',
-    UNIQUE (country_iso, metric_key, facility_name)
+    status                  VARCHAR(20) DEFAULT 'open'
 );
+CREATE UNIQUE INDEX IF NOT EXISTS cii_data_gaps_uq
+    ON cii_data_gaps (country_iso,
+                      COALESCE(metric_key, ''),
+                      COALESCE(facility_name, ''));
 
 -- ── VIEWS ────────────────────────────────────────────────────────
 
@@ -245,8 +248,7 @@ SELECT
     COUNT(*)                                                              AS total_facilities,
     SUM(CASE WHEN status = 'operational' THEN capacity_mw ELSE 0 END)    AS installed_mw,
     SUM(CASE WHEN status != 'operational' THEN capacity_mw ELSE 0 END)   AS committed_mw,
-    SUM(CASE WHEN status != 'operational' AND is_hyperscaler
-              THEN investment_value_usd ELSE 0 END)                       AS committed_usd,
+    SUM(CASE WHEN status != 'operational' THEN investment_value_usd ELSE 0 END) AS committed_usd,
     ROUND(AVG(confidence_score)::numeric, 3)                             AS avg_confidence
 FROM cii_facilities
 GROUP BY country_iso;
@@ -292,7 +294,7 @@ INSERT INTO cii_score_methodology (sub_index, metric_key, weight, invert, notes)
     ('SI2', 'qoq_committed_usd_growth_rate', 0.10, FALSE, 'QoQ growth of committed pipeline USD'),
     ('SI2', 'new_hyperscaler_commitments',   0.20, FALSE, 'New hyperscaler announcements per quarter'),
     ('SI2', 'grid_strain_ratio',             0.10, TRUE,  'Inverted: higher strain = lower score'),
-    ('SI3', 'chip_access_tier',              0.40, FALSE, '1=unrestricted latest-gen, 5=denied'),
+    ('SI3', 'chip_access_tier',              0.40, TRUE,  '1=unrestricted latest-gen, 5=denied; inverted so tier-1 scores highest'),
     ('SI3', 'hyperscaler_count',             0.20, FALSE, 'Distinct hyperscaler operators'),
     ('SI3', 'hyperscaler_investment_usd',    0.15, FALSE, 'Total hyperscaler committed investment'),
     ('SI3', 'domestic_ownership_ratio',      0.15, FALSE, 'Domestic capacity / total capacity'),

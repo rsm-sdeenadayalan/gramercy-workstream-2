@@ -122,8 +122,8 @@ Return ONLY the JSON array. No explanation."""
         )
         text = resp.content[0].text.strip()
         # strip markdown code fences if present
-        text = re.sub(r"^```[a-z]*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text)
+        match = re.search(r"```[a-zA-Z]*\n?(.*?)```", text, re.DOTALL)
+        text = match.group(1).strip() if match else text
         return json.loads(text)
     except Exception:
         return []
@@ -157,7 +157,12 @@ def upsert_facility(conn, run_id: str, f: dict) -> None:
                 is_hyperscaler       = EXCLUDED.is_hyperscaler,
                 has_estimated_fields = EXCLUDED.has_estimated_fields,
                 confidence_score     = GREATEST(EXCLUDED.confidence_score, cii_facilities.confidence_score),
-                source_count         = cii_facilities.source_count + EXCLUDED.source_count,
+                source_urls          = (
+                    SELECT ARRAY(SELECT DISTINCT unnest
+                                 FROM unnest(COALESCE(cii_facilities.source_urls, ARRAY[]::TEXT[]) ||
+                                             COALESCE(EXCLUDED.source_urls, ARRAY[]::TEXT[])))
+                ),
+                source_count         = GREATEST(EXCLUDED.source_count, cii_facilities.source_count),
                 last_updated_run_id  = EXCLUDED.last_updated_run_id,
                 collected_at         = NOW()
         """, {**f, "run_id": run_id,
@@ -181,19 +186,29 @@ def log_attempt(conn, run_id, country_iso, facility_name, pass_type,
 
 def upsert_gap(conn, country_iso, metric_key, facility_name,
                gap_type, failure_reason, severity, recommended_action=None):
+    norm_mk = metric_key if metric_key is not None else ""
+    norm_fn = facility_name if facility_name is not None else ""
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO cii_data_gaps
                 (country_iso, metric_key, facility_name, gap_type,
                  failure_reason, severity, recommended_action,
                  manual_review_required)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (country_iso, metric_key, facility_name) DO UPDATE SET
-                attempt_count     = cii_data_gaps.attempt_count + 1,
-                last_attempted    = NOW(),
-                failure_reason    = EXCLUDED.failure_reason,
-                manual_review_required = (cii_data_gaps.attempt_count + 1) >= 2
-        """, (country_iso, metric_key, facility_name or "",
-              gap_type, failure_reason, severity, recommended_action,
-              False))
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (country_iso, norm_mk or None, norm_fn or None,
+              gap_type, failure_reason, severity, recommended_action, False))
+
+        if cur.rowcount == 0:
+            # Row already existed — update it
+            cur.execute("""
+                UPDATE cii_data_gaps
+                SET attempt_count = attempt_count + 1,
+                    last_attempted = NOW(),
+                    failure_reason = %s,
+                    manual_review_required = (attempt_count + 1) >= 2
+                WHERE country_iso = %s
+                  AND COALESCE(metric_key, '') = %s
+                  AND COALESCE(facility_name, '') = %s
+            """, (failure_reason, country_iso, norm_mk, norm_fn))
     conn.commit()

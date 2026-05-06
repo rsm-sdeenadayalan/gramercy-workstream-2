@@ -1,0 +1,199 @@
+import os, json, time, re
+from datetime import date, datetime
+from dotenv import load_dotenv
+import psycopg2
+
+load_dotenv()
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+TAVILY_API_KEY    = os.environ.get("TAVILY_API_KEY", "")
+
+DB_CONFIG = {
+    "host":     os.environ.get("POSTGRES_HOST", "localhost"),
+    "port":     int(os.environ.get("POSTGRES_PORT", 5433)),
+    "dbname":   "cii",
+    "user":     os.environ.get("POSTGRES_USER", ""),
+    "password": os.environ.get("POSTGRES_PASSWORD", ""),
+}
+
+COUNTRIES = {
+    "US": "United States", "AE": "UAE",       "BR": "Brazil",
+    "IN": "India",         "SG": "Singapore", "PH": "Philippines",
+}
+
+CONFIDENCE = {
+    "official_ir":   0.90,
+    "multi_source":  0.85,
+    "trade_pub":     0.75,
+    "agent_multi":   0.70,
+    "agent_single":  0.65,
+    "benchmark_est": 0.50,
+}
+
+HYPERSCALER_BENCHMARK_MW = {
+    "Microsoft": 100.0, "Amazon": 100.0, "Google": 80.0,
+    "Meta": 80.0, "Oracle": 60.0, "default": 50.0,
+}
+
+HYPERSCALER_OPERATORS = {
+    "Microsoft", "Amazon", "AWS", "Google", "Meta", "Oracle",
+    "Apple", "Alibaba", "Tencent", "Huawei",
+}
+
+TRUSTED_DOMAINS = {
+    "US": ["aws.amazon.com", "azure.microsoft.com", "cloud.google.com",
+           "about.meta.com", "oracle.com", "datacenterknowledge.com",
+           "datacenterdynamics.com", "synergy-rp.com"],
+    "AE": ["dewa.gov.ae", "moei.gov.ae", "ewec.ae", "taqa.com",
+           "mubadala.com", "g42.ai", "datacenterdynamics.com"],
+    "BR": ["equinix.com.br", "ascenty.com", "hostdime.com.br",
+           "anatel.gov.br", "datacenterdynamics.com"],
+    "IN": ["niti.gov.in", "meity.gov.in", "stpi.in",
+           "datacenterdynamics.com", "economictimes.indiatimes.com"],
+    "SG": ["edb.gov.sg", "imda.gov.sg", "ema.gov.sg",
+           "datacenterdynamics.com", "straitstimes.com"],
+    "PH": ["dict.gov.ph", "peza.gov.ph",
+           "datacenterdynamics.com", "businessmirror.com.ph"],
+}
+
+DISCOVERY_QUERY_TEMPLATES = [
+    "{country} hyperscaler data center capacity MW announced {year}",
+    "{country} Microsoft Azure data center investment",
+    "{country} AWS Amazon data center facility",
+    "{country} Google cloud data center",
+    "{country} Meta AI data center",
+    "{country} Oracle data center",
+    "{country} data center energy permit MW grid connection {year}",
+    "{country} AI compute infrastructure investment billion USD {year}",
+]
+
+KNOWN_ZERO_FRONTIER = {"PH", "BR"}   # confirmed no frontier AI training
+
+
+def get_conn():
+    return psycopg2.connect(**DB_CONFIG)
+
+
+def web_search(query: str, count: int = 5) -> list[dict]:
+    key = os.environ.get("TAVILY_API_KEY", TAVILY_API_KEY)
+    if not key:
+        raise ValueError("TAVILY_API_KEY not set in .env")
+    from tavily import TavilyClient
+    client = TavilyClient(api_key=key)
+    resp = client.search(query, max_results=count,
+                         include_raw_content=False, search_depth="advanced")
+    return [
+        {"url": r.get("url", ""), "title": r.get("title", ""),
+         "content": r.get("content", "") or ""}
+        for r in resp.get("results", [])
+    ]
+
+
+def _extract_facilities_claude(client, results: list[dict],
+                                country_iso: str, country_name: str) -> list[dict]:
+    if not results:
+        return []
+    content_block = "\n\n".join(
+        f"Source: {r['url']}\nTitle: {r['title']}\nContent: {r['content'][:800]}"
+        for r in results if r.get("content")
+    )
+    if not content_block.strip():
+        return []
+    prompt = f"""Extract all AI/cloud data center facilities mentioned for {country_name} ({country_iso}).
+Return a JSON array. Each item must have these exact keys:
+  facility_name (string), operator (string), capacity_mw (number or null),
+  status (one of: operational, permitted, under_construction, announced),
+  date_announced (YYYY-MM-DD or null), date_operational (YYYY-MM-DD or null),
+  investment_value_usd (number in USD or null), energy_source (string or null),
+  chip_type_if_known (string or null),
+  ownership_type (one of: domestic, foreign, joint_venture, unknown),
+  is_hyperscaler (true/false), source_url (string)
+
+Sources:
+{content_block}
+
+Return ONLY the JSON array. No explanation."""
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = resp.content[0].text.strip()
+        # strip markdown code fences if present
+        text = re.sub(r"^```[a-z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+        return json.loads(text)
+    except Exception:
+        return []
+
+
+def upsert_facility(conn, run_id: str, f: dict) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO cii_facilities
+                (country_iso, facility_name, operator, capacity_mw, status,
+                 date_announced, date_operational, investment_value_usd,
+                 energy_source, chip_type_if_known, ownership_type, is_hyperscaler,
+                 has_estimated_fields, confidence_score, source_urls, source_count,
+                 first_seen_run_id, last_updated_run_id)
+            VALUES
+                (%(country_iso)s, %(facility_name)s, %(operator)s, %(capacity_mw)s,
+                 %(status)s, %(date_announced)s, %(date_operational)s,
+                 %(investment_value_usd)s, %(energy_source)s, %(chip_type_if_known)s,
+                 %(ownership_type)s, %(is_hyperscaler)s, %(has_estimated_fields)s,
+                 %(confidence_score)s, %(source_urls)s, %(source_count)s,
+                 %(run_id)s, %(run_id)s)
+            ON CONFLICT (country_iso, facility_name, operator) DO UPDATE SET
+                capacity_mw          = COALESCE(EXCLUDED.capacity_mw, cii_facilities.capacity_mw),
+                status               = EXCLUDED.status,
+                date_announced       = COALESCE(EXCLUDED.date_announced, cii_facilities.date_announced),
+                date_operational     = COALESCE(EXCLUDED.date_operational, cii_facilities.date_operational),
+                investment_value_usd = COALESCE(EXCLUDED.investment_value_usd, cii_facilities.investment_value_usd),
+                energy_source        = COALESCE(EXCLUDED.energy_source, cii_facilities.energy_source),
+                chip_type_if_known   = COALESCE(EXCLUDED.chip_type_if_known, cii_facilities.chip_type_if_known),
+                ownership_type       = EXCLUDED.ownership_type,
+                is_hyperscaler       = EXCLUDED.is_hyperscaler,
+                has_estimated_fields = EXCLUDED.has_estimated_fields,
+                confidence_score     = GREATEST(EXCLUDED.confidence_score, cii_facilities.confidence_score),
+                source_count         = cii_facilities.source_count + EXCLUDED.source_count,
+                last_updated_run_id  = EXCLUDED.last_updated_run_id,
+                collected_at         = NOW()
+        """, {**f, "run_id": run_id,
+              "source_urls": f.get("source_urls", []),
+              "has_estimated_fields": f.get("has_estimated_fields", False)})
+    conn.commit()
+
+
+def log_attempt(conn, run_id, country_iso, facility_name, pass_type,
+                query, source_url, status, confidence, elapsed_ms, error_msg=None):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO cii_collection_log
+                (run_id, country_iso, facility_name, pass_type, query,
+                 source_url, status, confidence, elapsed_ms, error_msg)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (run_id, country_iso, facility_name, pass_type, query,
+              source_url, status, confidence, elapsed_ms, error_msg))
+    conn.commit()
+
+
+def upsert_gap(conn, country_iso, metric_key, facility_name,
+               gap_type, failure_reason, severity, recommended_action=None):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO cii_data_gaps
+                (country_iso, metric_key, facility_name, gap_type,
+                 failure_reason, severity, recommended_action,
+                 manual_review_required)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (country_iso, metric_key, facility_name) DO UPDATE SET
+                attempt_count     = cii_data_gaps.attempt_count + 1,
+                last_attempted    = NOW(),
+                failure_reason    = EXCLUDED.failure_reason,
+                manual_review_required = (cii_data_gaps.attempt_count + 1) >= 2
+        """, (country_iso, metric_key, facility_name or "",
+              gap_type, failure_reason, severity, recommended_action,
+              False))
+    conn.commit()

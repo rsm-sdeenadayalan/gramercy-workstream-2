@@ -12,11 +12,13 @@ DB_CONFIG = {
     "user":     os.environ.get("POSTGRES_USER", ""),
     "password": os.environ.get("POSTGRES_PASSWORD", ""),
 }
+# Existing database to connect to for CREATE DATABASE (server has no 'postgres' db)
+BOOTSTRAP_DB = os.environ.get("POSTGRES_BOOTSTRAP_DB", "subindex_1")
 
 
 def create_db_if_not_exists(host, port, user, password):
     conn = psycopg2.connect(host=host, port=port, user=user,
-                            password=password, dbname="postgres")
+                            password=password, dbname=BOOTSTRAP_DB)
     try:
         conn.autocommit = True
         with conn.cursor() as cur:

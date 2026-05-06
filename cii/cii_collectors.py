@@ -31,7 +31,7 @@ CONFIDENCE = {
 }
 
 HYPERSCALER_BENCHMARK_MW = {
-    "Microsoft": 100.0, "Amazon": 100.0, "Google": 80.0,
+    "Microsoft": 100.0, "Amazon": 100.0, "AWS": 100.0, "Google": 80.0,
     "Meta": 80.0, "Oracle": 60.0, "default": 50.0,
 }
 
@@ -304,7 +304,7 @@ def run_enrichment_pass(conn, run_id: str, country_iso: str) -> int:
     """Pass 2: deep-dive each facility to fill in MW, investment, dates.
     Returns number of facilities enriched."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    enriched = 0
+    enriched_facilities: set = set()
 
     with conn.cursor() as cur:
         cur.execute("""
@@ -319,14 +319,15 @@ def run_enrichment_pass(conn, run_id: str, country_iso: str) -> int:
         for template in ENRICH_QUERY_TEMPLATES:
             query = template.format(facility_name=fname, operator=operator)
             t0 = time.perf_counter()
-            src_url = None
             try:
                 results = web_search(query, count=3)
                 enriched_data = _enrich_facility_claude(
                     client, results, {"facility_name": fname, "operator": operator}
                 )
                 if enriched_data:
+                    had_enrichment = True
                     src_url = enriched_data.pop("source_url", None)
+                    conf_score = enriched_data.get("confidence_score")
                     update = {
                         "country_iso": c_iso, "facility_name": fname,
                         "operator": operator,
@@ -338,13 +339,16 @@ def run_enrichment_pass(conn, run_id: str, country_iso: str) -> int:
                         "source_count": 1,
                     }
                     upsert_facility(conn, run_id, update)
-                    enriched += 1
+                    enriched_facilities.add(fname)
+                else:
+                    had_enrichment = False
+                    src_url = None
+                    conf_score = None
                 elapsed = int((time.perf_counter() - t0) * 1000)
                 log_attempt(conn, run_id, c_iso, fname, "enrichment",
-                            query, src_url if enriched_data else None,
-                            "success" if enriched_data else "gap",
-                            enriched_data.get("confidence_score") if enriched_data else None,
-                            elapsed)
+                            query, src_url,
+                            "success" if had_enrichment else "gap",
+                            conf_score, elapsed)
             except Exception as exc:
                 elapsed = int((time.perf_counter() - t0) * 1000)
                 log_attempt(conn, run_id, c_iso, fname, "enrichment",
@@ -357,9 +361,9 @@ def run_enrichment_pass(conn, run_id: str, country_iso: str) -> int:
             SET facilities_enriched = facilities_enriched + %s,
                 tavily_calls_used   = tavily_calls_used + %s
             WHERE run_id = %s
-        """, (enriched, len(facilities) * len(ENRICH_QUERY_TEMPLATES), run_id))
+        """, (len(enriched_facilities), len(facilities) * len(ENRICH_QUERY_TEMPLATES), run_id))
     conn.commit()
-    return enriched
+    return len(enriched_facilities)
 
 
 def run_validation_pass(conn, run_id: str, country_iso: str) -> int:

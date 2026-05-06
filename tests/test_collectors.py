@@ -156,6 +156,8 @@ def test_enrichment_updates_capacity_mw(mock_conn):
         enriched = run_enrichment_pass(mock_conn, "run-123", "US")
         assert enriched >= 1
         assert mock_upsert.call_count >= 1
+        call_kwargs = mock_upsert.call_args[0][2]
+        assert call_kwargs["capacity_mw"] == 200.0
 
 
 def test_validation_assigns_high_confidence_for_multi_source(mock_conn):
@@ -164,11 +166,11 @@ def test_validation_assigns_high_confidence_for_multi_source(mock_conn):
     ]
     with patch("cii_collectors.log_attempt"), \
          patch("cii_collectors.upsert_facility") as mock_upsert:
-        from cii_collectors import run_validation_pass
+        from cii_collectors import run_validation_pass, CONFIDENCE
         run_validation_pass(mock_conn, "run-123", "US")
-        if mock_upsert.called:
-            call_kwargs = mock_upsert.call_args[0][2]
-            assert call_kwargs["confidence_score"] >= 0.85
+        assert mock_upsert.called
+        call_kwargs = mock_upsert.call_args[0][2]
+        assert call_kwargs["confidence_score"] == CONFIDENCE["multi_source"]
 
 
 def test_validation_applies_benchmark_when_mw_missing(mock_conn):

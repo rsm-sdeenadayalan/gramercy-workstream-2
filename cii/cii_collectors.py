@@ -1,4 +1,4 @@
-import os, json, time, re
+import os, json, time, re, anthropic
 from datetime import date, datetime
 from dotenv import load_dotenv
 import psycopg2
@@ -217,7 +217,6 @@ def upsert_gap(conn, country_iso, metric_key, facility_name,
 def run_discovery_pass(conn, run_id: str, country_iso: str) -> int:
     """Pass 1: enumerate all AI data center facilities for a country.
     Returns number of facilities discovered."""
-    import anthropic
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     country_name = COUNTRIES[country_iso]
     year = date.today().year
@@ -234,7 +233,8 @@ def run_discovery_pass(conn, run_id: str, country_iso: str) -> int:
                     continue
                 fac["country_iso"]       = country_iso
                 fac["confidence_score"]  = CONFIDENCE["agent_single"]
-                fac["source_urls"]       = [fac.pop("source_url", "")] if fac.get("source_url") else []
+                src_url = fac.pop("source_url", None)
+                fac["source_urls"] = [src_url] if src_url else []
                 fac["source_count"]      = 1
                 fac["has_estimated_fields"] = False
                 upsert_facility(conn, run_id, fac)

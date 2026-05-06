@@ -106,9 +106,13 @@ def test_run_discovery_pass_upserts_facilities(mock_conn):
         assert mock_upsert.call_count >= 1
         call_kwargs = mock_upsert.call_args[0][2]
         assert call_kwargs["confidence_score"] == CONFIDENCE["agent_single"]
+        assert call_kwargs["country_iso"] == "US"
+        assert call_kwargs["source_count"] == 1
+        assert call_kwargs["has_estimated_fields"] is False
+        assert isinstance(call_kwargs["source_urls"], list)
 
 
-def test_run_discovery_pass_deduplicates_same_facility(mock_conn):
+def test_run_discovery_pass_calls_upsert_per_query(mock_conn):
     with patch("cii_collectors.web_search") as mock_search, \
          patch("cii_collectors._extract_facilities_claude") as mock_extract, \
          patch("cii_collectors.upsert_facility") as mock_upsert, \
@@ -128,6 +132,5 @@ def test_run_discovery_pass_deduplicates_same_facility(mock_conn):
 
         from cii_collectors import run_discovery_pass
         run_discovery_pass(mock_conn, "run-123", "US")
-        # upsert_facility called once per facility per query (8 queries × 1 facility = 8)
-        # DB UNIQUE constraint handles dedup — Python side calls upsert for each occurrence
-        assert mock_upsert.call_count >= 1
+        # 8 queries × 1 facility per query = 8 upsert calls; DB UNIQUE constraint deduplicates
+        assert mock_upsert.call_count == 8

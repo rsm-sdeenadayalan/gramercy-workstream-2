@@ -1,4 +1,4 @@
-import os, json, re, time
+import json, re, time
 import anthropic
 from datetime import date
 from dotenv import load_dotenv
@@ -21,7 +21,6 @@ OWNERSHIP_QUERIES = {
 }
 
 FRONTIER_QUERIES = {
-    "US": "United States frontier AI model training GPT-4 Claude Gemini in-jurisdiction",
     "AE": "UAE frontier AI model training in-country G42 Falcon TII",
     "BR": "Brazil frontier AI model training domestic",
     "IN": "India frontier AI model training in-jurisdiction domestic",
@@ -111,12 +110,16 @@ def collect_frontier_training(conn, run_id: str, country_iso: str) -> None:
         upsert_raw_metric(conn, run_id, country_iso, "SI3",
                           "frontier_training_present", 0.0, "boolean",
                           0.90, "known_zero_documented")
+        log_attempt(conn, run_id, country_iso, None, "si3",
+                    f"known_zero:{country_iso}", None, "success", 0.90, 0)
         return
 
     if country_iso in FRONTIER_TRAINING_COUNTRIES:
         upsert_raw_metric(conn, run_id, country_iso, "SI3",
                           "frontier_training_present", 1.0, "boolean",
                           0.90, "known_confirmed")
+        log_attempt(conn, run_id, country_iso, None, "si3",
+                    f"known_confirmed:{country_iso}", None, "success", 0.90, 0)
         return
 
     # For ambiguous countries — search and classify

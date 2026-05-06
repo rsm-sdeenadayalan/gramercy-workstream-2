@@ -36,3 +36,7 @@ def test_domestic_ownership_writes_raw_metric(mock_conn):
 
         calls = mock_conn.cursor.return_value.__enter__.return_value.execute.call_args_list
         assert any("cii_raw_metrics" in str(c) for c in calls)
+        # Also verify the ratio value and metric key appear in the SQL args
+        insert_args_list = [c[0][1] for c in calls if "cii_raw_metrics" in str(c) and len(c[0]) > 1 and isinstance(c[0][1], tuple)]
+        assert any("domestic_ownership_ratio" in str(args) for args in insert_args_list)
+        assert any("0.3" in str(args) for args in insert_args_list)

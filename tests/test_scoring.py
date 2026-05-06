@@ -77,3 +77,34 @@ def test_compute_si3_derived_writes_hyperscaler_count():
         assert "hyperscaler_count" in calls
         assert "hyperscaler_investment_usd" in calls
         assert "chip_access_tier" in calls
+
+
+def test_minmax_normalization():
+    from cii_scoring import _minmax_normalize
+    values = {"US": 500.0, "AE": 200.0, "BR": 50.0, "IN": 300.0, "SG": 150.0, "PH": 30.0}
+    normed = _minmax_normalize(values, invert=False)
+    assert abs(normed["US"] - 100.0) < 0.001
+    assert abs(normed["PH"] - 0.0) < 0.001
+    assert 0.0 <= normed["AE"] <= 100.0
+
+
+def test_minmax_normalization_inverted():
+    from cii_scoring import _minmax_normalize
+    values = {"US": 0.10, "AE": 0.50, "BR": 0.30, "IN": 0.20, "SG": 0.05, "PH": 0.60}
+    normed = _minmax_normalize(values, invert=True)
+    # SG has lowest stress → highest score after inversion
+    assert normed["SG"] == max(normed.values())
+    assert normed["PH"] == min(normed.values())
+
+
+def test_sc_gap_interpretation():
+    from cii_scoring import _interpret_sc_gap
+    assert _interpret_sc_gap(-0.50) == "under_converting"   # CII > SDI
+    assert _interpret_sc_gap(0.10)  == "near_parity"
+    assert _interpret_sc_gap(1.20)  == "over_converting"    # SDI > CII
+
+
+def test_sc_gap_negative_means_cii_exceeds_sdi():
+    from cii_scoring import _interpret_sc_gap
+    # UAE model: CII > SDI → gap negative → under_converting label
+    assert _interpret_sc_gap(-1.5) == "under_converting"

@@ -212,3 +212,48 @@ def upsert_gap(conn, country_iso, metric_key, facility_name,
                   AND COALESCE(facility_name, '') = %s
             """, (failure_reason, country_iso, norm_mk, norm_fn))
     conn.commit()
+
+
+def run_discovery_pass(conn, run_id: str, country_iso: str) -> int:
+    """Pass 1: enumerate all AI data center facilities for a country.
+    Returns number of facilities discovered."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    country_name = COUNTRIES[country_iso]
+    year = date.today().year
+    found = 0
+
+    for template in DISCOVERY_QUERY_TEMPLATES:
+        query = template.format(country=country_name, year=year)
+        t0 = time.perf_counter()
+        try:
+            results = web_search(query, count=5)
+            facilities = _extract_facilities_claude(client, results, country_iso, country_name)
+            for fac in facilities:
+                if not fac.get("facility_name") or not fac.get("operator"):
+                    continue
+                fac["country_iso"]       = country_iso
+                fac["confidence_score"]  = CONFIDENCE["agent_single"]
+                fac["source_urls"]       = [fac.pop("source_url", "")] if fac.get("source_url") else []
+                fac["source_count"]      = 1
+                fac["has_estimated_fields"] = False
+                upsert_facility(conn, run_id, fac)
+                found += 1
+            elapsed = int((time.perf_counter() - t0) * 1000)
+            log_attempt(conn, run_id, country_iso, None, "discovery",
+                        query, None, "success", CONFIDENCE["agent_single"], elapsed)
+        except Exception as exc:
+            elapsed = int((time.perf_counter() - t0) * 1000)
+            log_attempt(conn, run_id, country_iso, None, "discovery",
+                        query, None, "failed", None, elapsed, str(exc)[:500])
+        time.sleep(0.3)  # respect Tavily rate limits
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE cii_collection_runs
+            SET facilities_discovered = facilities_discovered + %s,
+                tavily_calls_used = tavily_calls_used + %s
+            WHERE run_id = %s
+        """, (found, len(DISCOVERY_QUERY_TEMPLATES), run_id))
+    conn.commit()
+    return found

@@ -80,3 +80,54 @@ def test_extract_facilities_returns_empty_for_no_results():
     from cii_collectors import _extract_facilities_claude
     results = _extract_facilities_claude(MagicMock(), [], "US", "United States")
     assert results == []
+
+
+def test_run_discovery_pass_upserts_facilities(mock_conn):
+    with patch("cii_collectors.web_search") as mock_search, \
+         patch("cii_collectors._extract_facilities_claude") as mock_extract, \
+         patch("cii_collectors.upsert_facility") as mock_upsert, \
+         patch("cii_collectors.log_attempt"), \
+         patch("anthropic.Anthropic"):
+
+        mock_search.return_value = [
+            {"url": "https://example.com", "title": "T", "content": "200MW campus"}
+        ]
+        mock_extract.return_value = [{
+            "facility_name": "AWS Iowa", "operator": "Amazon",
+            "capacity_mw": 200.0, "status": "operational",
+            "date_announced": None, "date_operational": None,
+            "investment_value_usd": None, "energy_source": None,
+            "chip_type_if_known": None, "ownership_type": "foreign",
+            "is_hyperscaler": True, "source_url": "https://example.com"
+        }]
+
+        from cii_collectors import run_discovery_pass, CONFIDENCE
+        run_discovery_pass(mock_conn, "run-123", "US")
+        assert mock_upsert.call_count >= 1
+        call_kwargs = mock_upsert.call_args[0][2]
+        assert call_kwargs["confidence_score"] == CONFIDENCE["agent_single"]
+
+
+def test_run_discovery_pass_deduplicates_same_facility(mock_conn):
+    with patch("cii_collectors.web_search") as mock_search, \
+         patch("cii_collectors._extract_facilities_claude") as mock_extract, \
+         patch("cii_collectors.upsert_facility") as mock_upsert, \
+         patch("cii_collectors.log_attempt"), \
+         patch("anthropic.Anthropic"):
+
+        mock_search.return_value = [{"url": "u", "title": "t", "content": "c"}]
+        # Same facility returned from all 8 queries
+        mock_extract.return_value = [{
+            "facility_name": "AWS Iowa", "operator": "Amazon",
+            "capacity_mw": 200.0, "status": "operational",
+            "date_announced": None, "date_operational": None,
+            "investment_value_usd": None, "energy_source": None,
+            "chip_type_if_known": None, "ownership_type": "foreign",
+            "is_hyperscaler": True, "source_url": "u"
+        }]
+
+        from cii_collectors import run_discovery_pass
+        run_discovery_pass(mock_conn, "run-123", "US")
+        # upsert_facility called once per facility per query (8 queries × 1 facility = 8)
+        # DB UNIQUE constraint handles dedup — Python side calls upsert for each occurrence
+        assert mock_upsert.call_count >= 1

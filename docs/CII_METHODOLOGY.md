@@ -298,20 +298,50 @@ computation against SDI scores.
 
 ---
 
-## 8. Country Results
+## 8. Country Results — Where to Find Them
 
-The index produces the following per-country outputs, refreshed each quarterly run:
+**Primary stakeholder view: `v_cii_latest_scores`.** This is the single table to read for
+the headline result. It returns, for the most recent completed run, each country's CII
+score, the three sub-index scores, and rank — ordered best to worst:
 
-- **Final CII score and rank** — `cii_score_final`, surfaced via `v_cii_latest_scores`.
-- **Sub-index breakdown** — SI1 / SI2 / SI3 composites per country, in
-  `cii_score_subindex`.
-- **Facility-level capacity tables** — every collected facility with capacity, status,
-  operator, investment, confidence, and source URLs, in `cii_facilities`; aggregated in
-  `v_cii_facilities_summary`.
-- **S-C Gap per country** — gap value, archetype interpretation, and rank, in
-  `cii_sc_gap`, surfaced via `v_cii_sc_gap_ranked`.
-- **Growth-velocity time series** — quarterly snapshots accumulate in
-  `cii_quarterly_snapshots`; QoQ rates become available once two or more quarters exist.
+| Column | Meaning |
+|--------|---------|
+| `country_iso` | Country (US, AE, BR, IN, SG, PH) |
+| `capacity_score` | SI1 — Installed and Committed Capacity |
+| `velocity_score` | SI2 — Growth Velocity |
+| `quality_score` | SI3 — Compute Quality and Access |
+| `cii` | Final composite CII score (0–100) |
+| `rank` | 1 = highest CII |
+| `as_of_oldest` / `as_of_newest` | Data date range |
+
+```sql
+SELECT * FROM v_cii_latest_scores;
+```
+
+**S-C Gap stakeholder view: `v_cii_sc_gap_ranked`.** Each country's SDI-vs-CII comparison,
+the gap, and the archetype interpretation (over_converting / near_parity /
+under_converting), ranked by degree of under-conversion:
+
+```sql
+SELECT * FROM v_cii_sc_gap_ranked;
+```
+
+Both stakeholder views filter automatically to the most recent **completed** run, so they
+always show current results without needing a run_id.
+
+### Full output set
+
+| Output | Table / View | Notes |
+|--------|--------------|-------|
+| **Headline scores + rank** | `v_cii_latest_scores` | ← stakeholders start here |
+| **S-C Gap + interpretation** | `v_cii_sc_gap_ranked` | ← stakeholders start here |
+| Final CII score and rank (raw) | `cii_score_final` | one row per run/country |
+| Sub-index composites | `cii_score_subindex` | SI1 / SI2 / SI3 per country |
+| Per-metric normalization detail | `cii_score_metric_normalized` | audit trail: raw → normalized → weighted |
+| Facility-level capacity records | `cii_facilities` | SI1 raw data |
+| Facility aggregates per country | `v_cii_facilities_summary` | installed / committed MW totals |
+| Growth-velocity time series | `cii_quarterly_snapshots` | QoQ rates need ≥2 quarters |
+| Tracked data gaps | `cii_data_gaps` | severity + recommended action |
 
 ---
 

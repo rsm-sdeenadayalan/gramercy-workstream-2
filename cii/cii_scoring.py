@@ -108,8 +108,22 @@ def compute_si2_all_countries(conn, run_id: str) -> None:
     quarter = _quarter_label(today)
     q_end   = _quarter_end(today)
 
+    print(f"  [SI2] computing {quarter} snapshot (quarter_end={q_end}) "
+          f"for {len(COUNTRIES)} countries")
+
     for country_iso in COUNTRIES:
+        print(f"  [SI2:{country_iso}] aggregating facilities → snapshot")
         snap = _compute_si2_snapshot(conn, country_iso, quarter, q_end)
+        print(f"  [SI2:{country_iso}]   installed_mw={snap['installed_mw']} "
+              f"committed_mw={snap['committed_mw']} "
+              f"committed_usd={snap['committed_usd']}")
+        print(f"  [SI2:{country_iso}]   pipeline_multiplier={snap['pipeline_multiplier']} "
+              f"new_hyperscaler_commitments={snap['hyperscaler_commitments_count']}")
+        print(f"  [SI2:{country_iso}]   QoQ installed={snap['qoq_installed_growth_rate']} "
+              f"committed_mw={snap['qoq_committed_mw_growth_rate']} "
+              f"committed_usd={snap['qoq_committed_usd_growth_rate']}")
+        print(f"  [SI2:{country_iso}]   grid_mw={snap['national_grid_mw']} "
+              f"grid_strain_ratio={snap['grid_strain_ratio']}")
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO cii_quarterly_snapshots
@@ -145,10 +159,17 @@ def compute_si2_all_countries(conn, run_id: str) -> None:
             "committed_pipeline_mw": (snap["committed_mw"],       "MW",    0.80),
             "pipeline_multiplier":   (snap["pipeline_multiplier"], "ratio", 0.85),
         }
+        si1_written = 0
+        si1_skipped = []
         for mk, (val, unit, conf) in si1_metrics.items():
             if val is not None:
                 upsert_raw_metric(conn, run_id, country_iso, "SI1",
                                   mk, val, unit, conf, "cii_facilities_aggregate")
+                si1_written += 1
+            else:
+                si1_skipped.append(mk)
+        print(f"  [SI2:{country_iso}]   wrote {si1_written} SI1 raw metrics"
+              + (f" | skipped (null): {si1_skipped}" if si1_skipped else ""))
 
         si2_metrics = {
             "qoq_installed_growth_rate":     (snap["qoq_installed_growth_rate"],     "rate", 0.85),
@@ -157,14 +178,22 @@ def compute_si2_all_countries(conn, run_id: str) -> None:
             "new_hyperscaler_commitments":   (snap["hyperscaler_commitments_count"], "count", 0.85),
             "grid_strain_ratio":             (snap["grid_strain_ratio"],             "ratio", 0.80),
         }
+        si2_written = 0
+        si2_skipped = []
         for mk, (val, unit, conf) in si2_metrics.items():
             if val is not None:
                 upsert_raw_metric(conn, run_id, country_iso, "SI2",
                                   mk, val, unit, conf, "cii_quarterly_snapshots")
+                si2_written += 1
+            else:
+                si2_skipped.append(mk)
+        print(f"  [SI2:{country_iso}]   wrote {si2_written} SI2 raw metrics"
+              + (f" | skipped (null): {si2_skipped}" if si2_skipped else ""))
 
 
 def compute_si3_derived(conn, run_id: str, country_iso: str) -> None:
     """Derive SI3 metrics computed from cii_facilities (not from search)."""
+    print(f"  [SI3-derived:{country_iso}] computing from cii_facilities")
     with conn.cursor() as cur:
         cur.execute("""
             SELECT COUNT(DISTINCT operator), COALESCE(SUM(investment_value_usd), 0)
@@ -175,6 +204,9 @@ def compute_si3_derived(conn, run_id: str, country_iso: str) -> None:
 
     hs_count  = int(row[0])  if row else 0
     hs_invest = float(row[1]) if row else 0.0
+
+    print(f"  [SI3-derived:{country_iso}]   hyperscaler_count={hs_count} "
+          f"hyperscaler_investment_usd={hs_invest}")
 
     upsert_raw_metric(conn, run_id, country_iso, "SI3",
                       "hyperscaler_count", float(hs_count), "count", 0.90,
@@ -191,9 +223,13 @@ def compute_si3_derived(conn, run_id: str, country_iso: str) -> None:
         """, (country_iso,))
         tier_row = cur.fetchone()
     if tier_row:
+        print(f"  [SI3-derived:{country_iso}]   chip_access_tier={tier_row[0]} "
+              f"(from cii_chip_access seed)")
         upsert_raw_metric(conn, run_id, country_iso, "SI3",
                           "chip_access_tier", float(tier_row[0]), "tier",
                           0.90, "cii_chip_access_seeded")
+    else:
+        print(f"  [SI3-derived:{country_iso}]   ○ no chip_access_tier seed row found — skipped")
 
 
 def _minmax_normalize(values: dict, invert: bool = False) -> dict:
@@ -214,25 +250,34 @@ def _minmax_normalize(values: dict, invert: bool = False) -> dict:
 
 
 def _interpret_sc_gap(gap: float) -> str:
+    # gap = SDI - CII (both normalized to 0-5).
+    # gap < 0  → CII > SDI → over_converting (UAE model: importing substrate via capital)
+    # gap > 0  → SDI > CII → under_converting (Brazil model: value leaking via commodity export)
+    # |gap| ≤ 0.25 → near_parity (US model: converting at endowment rate)
     if gap < -0.25:
-        return "under_converting"
-    if gap > 0.25:
         return "over_converting"
+    if gap > 0.25:
+        return "under_converting"
     return "near_parity"
 
 
 def run_scoring(conn, run_id: str) -> None:
     """Read cii_raw_metrics, normalize per metric, apply weights,
     compute sub-index composites and final CII score."""
+    print(f"  [scoring] loading methodology + subindex weights")
     with conn.cursor() as cur:
         cur.execute("SELECT sub_index, metric_key, weight, invert FROM cii_score_methodology")
         methodology = {(r[0], r[1]): (r[2], r[3]) for r in cur.fetchall()}
         cur.execute("SELECT sub_index, weight FROM cii_subindex_weights")
         si_weights = dict(cur.fetchall())
 
+    print(f"  [scoring]   loaded {len(methodology)} metric weights "
+          f"| subindex weights: {si_weights}")
+
     countries = list(COUNTRIES.keys())
     today = date.today()
 
+    print(f"  [scoring] loading latest raw metrics for {len(countries)} countries")
     raw: dict[tuple, float] = {}
     with conn.cursor() as cur:
         cur.execute("""
@@ -245,16 +290,22 @@ def run_scoring(conn, run_id: str) -> None:
         """)
         for c_iso, mk, val, _ in cur.fetchall():
             raw[(c_iso, mk)] = val
+    print(f"  [scoring]   loaded {len(raw)} (country, metric) raw values")
 
     subindex_scores: dict[str, dict[str, float]] = {si: {} for si in ("SI1", "SI2", "SI3")}
 
+    print(f"  [scoring] normalizing + weighting {len(methodology)} metrics across countries")
     for (si, mk), (weight, invert) in methodology.items():
         country_vals = {c: raw.get((c, mk)) for c in countries}
         normed = _minmax_normalize(country_vals, invert=invert)
-
+        present = sum(1 for v in country_vals.values() if v is not None)
+        print(f"  [scoring]   [{si}/{mk}] weight={weight} invert={invert} "
+              f"| {present}/{len(countries)} countries have data")
         for c_iso in countries:
             n = normed.get(c_iso)
             ws = round(n * weight, 6) if n is not None else None
+            raw_v = raw.get((c_iso, mk))
+            print(f"  [scoring]     {c_iso}: raw={raw_v} → norm={n} → weighted={ws}")
 
             with conn.cursor() as cur:
                 cur.execute("""
@@ -272,10 +323,15 @@ def run_scoring(conn, run_id: str) -> None:
             if ws is not None:
                 subindex_scores[si][c_iso] = subindex_scores[si].get(c_iso, 0.0) + ws
 
+    print(f"  [scoring] writing sub-index composites")
     final_scores: dict[str, dict] = {}
     for si, scores in subindex_scores.items():
         si_weight = si_weights.get(si, 0.0)
+        print(f"  [scoring]   {si} (weight={si_weight}):")
         for c_iso, score in scores.items():
+            weighted = round(score * si_weight, 6)
+            print(f"  [scoring]     {c_iso}: composite={round(score, 4)} "
+                  f"→ weighted={weighted}")
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO cii_score_subindex
@@ -286,7 +342,7 @@ def run_scoring(conn, run_id: str) -> None:
                         score          = EXCLUDED.score,
                         weighted_score = EXCLUDED.weighted_score
                 """, (run_id, c_iso, si, round(score, 4), si_weight,
-                      round(score * si_weight, 6), today, today))
+                      weighted, today, today))
             conn.commit()
             if c_iso not in final_scores:
                 final_scores[c_iso] = {"SI1": None, "SI2": None, "SI3": None}
@@ -301,8 +357,13 @@ def run_scoring(conn, run_id: str) -> None:
         cii_vals[c_iso] = round(total, 4)
 
     ranked = sorted(cii_vals.items(), key=lambda x: x[1], reverse=True)
+    print(f"  [scoring] final CII ranking:")
     for rank, (c_iso, cii_score) in enumerate(ranked, 1):
         si_map = final_scores.get(c_iso, {})
+        print(f"  [scoring]   #{rank} {c_iso}: CII={cii_score} "
+              f"(SI1={round(si_map.get('SI1') or 0, 2)} "
+              f"SI2={round(si_map.get('SI2') or 0, 2)} "
+              f"SI3={round(si_map.get('SI3') or 0, 2)})")
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO cii_score_final
@@ -319,12 +380,16 @@ def run_scoring(conn, run_id: str) -> None:
 
 def compute_sc_gap(conn, run_id: str) -> None:
     """Read CII scores and SDI scores; compute and store S-C Gap."""
+    print(f"  [SC-Gap] loading CII final scores for run_id={run_id}")
     with conn.cursor() as cur:
         cur.execute("""
             SELECT country_iso, cii_score FROM cii_score_final WHERE run_id = %s
         """, (run_id,))
         cii_rows = dict(cur.fetchall())
+    print(f"  [SC-Gap]   loaded {len(cii_rows)} CII scores: {dict(cii_rows)}")
 
+    print(f"  [SC-Gap] fetching SDI scores from csi_scores DB "
+          f"({SDI_DB_CONFIG['host']}:{SDI_DB_CONFIG['port']})")
     try:
         sdi_conn = psycopg2.connect(**SDI_DB_CONFIG)
         try:
@@ -333,19 +398,34 @@ def compute_sc_gap(conn, run_id: str) -> None:
                 sdi_rows = dict(cur.fetchall())
         finally:
             sdi_conn.close()
-    except Exception:
+        print(f"  [SC-Gap]   loaded {len(sdi_rows)} SDI scores: {dict(sdi_rows)}")
+    except Exception as exc:
+        print(f"  [SC-Gap]   ✗ SDI fetch FAILED: {exc} — proceeding with no SDI data")
         sdi_rows = {}
 
     today = date.today()
+    written = 0
+    skipped_no_cii = 0
+    skipped_no_sdi = 0
     for c_iso in COUNTRIES:
         cii_raw = cii_rows.get(c_iso)
         sdi_raw = sdi_rows.get(c_iso)
         if cii_raw is None:
+            print(f"  [SC-Gap]   {c_iso}: ○ no CII score for this run — skipping")
+            skipped_no_cii += 1
             continue
         cii_norm = round(cii_raw / 20.0, 4)
         sdi_norm = round(sdi_raw / 20.0, 4) if sdi_raw else None
         gap      = round(sdi_norm - cii_norm, 4) if sdi_norm is not None else None
         interp   = _interpret_sc_gap(gap) if gap is not None else None
+
+        if sdi_norm is None:
+            print(f"  [SC-Gap]   {c_iso}: CII={cii_raw} (norm={cii_norm}) "
+                  f"| SDI missing → gap=NULL")
+            skipped_no_sdi += 1
+        else:
+            print(f"  [SC-Gap]   {c_iso}: CII={cii_raw}→{cii_norm} "
+                  f"SDI={sdi_raw}→{sdi_norm} | gap={gap} → {interp}")
 
         with conn.cursor() as cur:
             cur.execute("""
@@ -358,3 +438,7 @@ def compute_sc_gap(conn, run_id: str) -> None:
             """, (run_id, c_iso, sdi_raw, sdi_norm,
                   cii_raw, cii_norm, gap, interp))
         conn.commit()
+        written += 1
+
+    print(f"  [SC-Gap] complete: {written} rows written "
+          f"| skipped: {skipped_no_cii} no-CII, {skipped_no_sdi} no-SDI")

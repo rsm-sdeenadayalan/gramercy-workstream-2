@@ -79,26 +79,34 @@ Return ONLY the JSON."""
 def collect_domestic_ownership(conn, run_id: str, country_iso: str) -> None:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     query = OWNERSHIP_QUERIES[country_iso]
+    print(f"    [SI3:{country_iso}] domestic_ownership query: {query}")
     t0 = time.perf_counter()
     try:
         results = web_search(query, count=5)
+        print(f"    [SI3:{country_iso}] → {len(results)} web results")
         data = _extract_ownership_claude(client, results, country_iso)
         if data and data.get("domestic_ratio") is not None:
+            ratio = round(data["domestic_ratio"], 4)
+            conf = data.get("confidence", CONFIDENCE["agent_single"])
+            print(f"    [SI3:{country_iso}] ✓ domestic_ratio={ratio} "
+                  f"(foreign={round(1-ratio,4)}) conf={conf}")
             upsert_raw_metric(conn, run_id, country_iso, "SI3",
                               "domestic_ownership_ratio",
-                              round(data["domestic_ratio"], 4), "ratio",
-                              data.get("confidence", CONFIDENCE["agent_single"]),
-                              "research_agent")
+                              ratio, "ratio", conf, "research_agent")
         else:
+            print(f"    [SI3:{country_iso}] ○ Claude could not extract ownership ratio "
+                  f"→ recording gap (severity=medium)")
             upsert_gap(conn, country_iso, "domestic_ownership_ratio", None,
                        "metric_gap", "Could not extract ownership ratio",
                        "medium")
         elapsed = int((time.perf_counter() - t0) * 1000)
+        print(f"    [SI3:{country_iso}] domestic_ownership done in {elapsed}ms")
         log_attempt(conn, run_id, country_iso, None, "si3", query, None,
                     "success" if data else "gap",
                     data.get("confidence") if data else None, elapsed)
     except Exception as exc:
         elapsed = int((time.perf_counter() - t0) * 1000)
+        print(f"    [SI3:{country_iso}] ✗ domestic_ownership FAILED ({elapsed}ms): {exc}")
         log_attempt(conn, run_id, country_iso, None, "si3", query, None,
                     "failed", None, elapsed, str(exc)[:500])
 
@@ -107,6 +115,8 @@ def collect_frontier_training(conn, run_id: str, country_iso: str) -> None:
     """Collect frontier AI training presence.
     Known zeros (PH, BR) stored directly without search."""
     if country_iso in KNOWN_ZERO_FRONTIER:
+        print(f"    [SI3:{country_iso}] frontier_training: known_zero shortcut "
+              f"(value=0.0, conf=0.90) — no search needed")
         upsert_raw_metric(conn, run_id, country_iso, "SI3",
                           "frontier_training_present", 0.0, "boolean",
                           0.90, "known_zero_documented")
@@ -115,6 +125,8 @@ def collect_frontier_training(conn, run_id: str, country_iso: str) -> None:
         return
 
     if country_iso in FRONTIER_TRAINING_COUNTRIES:
+        print(f"    [SI3:{country_iso}] frontier_training: known_confirmed shortcut "
+              f"(value=1.0, conf=0.90) — no search needed")
         upsert_raw_metric(conn, run_id, country_iso, "SI3",
                           "frontier_training_present", 1.0, "boolean",
                           0.90, "known_confirmed")
@@ -125,9 +137,11 @@ def collect_frontier_training(conn, run_id: str, country_iso: str) -> None:
     # For ambiguous countries — search and classify
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     query = FRONTIER_QUERIES[country_iso]
+    print(f"    [SI3:{country_iso}] frontier_training query: {query}")
     t0 = time.perf_counter()
     try:
         results = web_search(query, count=3)
+        print(f"    [SI3:{country_iso}] → {len(results)} web results")
         content = " ".join(r.get("content", "") for r in results)
         prompt = f"""Is there confirmed frontier AI model training (GPT-4 scale or larger)
 happening in-jurisdiction in {COUNTRIES[country_iso]}?
@@ -143,15 +157,23 @@ Return ONLY the JSON."""
         text = match.group(1).strip() if match else text
         data = json.loads(text)
         value = 1.0 if data.get("present") else 0.0
+        conf = data.get("confidence", CONFIDENCE["agent_single"])
+        evidence = data.get("evidence", "")
+        print(f"    [SI3:{country_iso}] ✓ frontier_present={bool(data.get('present'))} "
+              f"(value={value}) conf={conf}")
+        if evidence:
+            print(f"    [SI3:{country_iso}]   evidence: {evidence[:160]}")
         upsert_raw_metric(conn, run_id, country_iso, "SI3",
                           "frontier_training_present", value, "boolean",
-                          data.get("confidence", CONFIDENCE["agent_single"]),
-                          "research_agent")
+                          conf, "research_agent")
         elapsed = int((time.perf_counter() - t0) * 1000)
+        print(f"    [SI3:{country_iso}] frontier_training done in {elapsed}ms")
         log_attempt(conn, run_id, country_iso, None, "si3", query, None,
                     "success", data.get("confidence"), elapsed)
     except Exception as exc:
         elapsed = int((time.perf_counter() - t0) * 1000)
+        print(f"    [SI3:{country_iso}] ✗ frontier_training FAILED ({elapsed}ms): {exc} "
+              f"→ recording gap (severity=medium)")
         log_attempt(conn, run_id, country_iso, None, "si3", query, None,
                     "failed", None, elapsed, str(exc)[:500])
         upsert_gap(conn, country_iso, "frontier_training_present", None,

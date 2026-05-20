@@ -6,6 +6,9 @@ import os, sys, uuid, time, argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 load_dotenv()
 sys.path.insert(0, os.path.dirname(__file__))
 

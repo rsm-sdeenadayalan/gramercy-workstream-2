@@ -99,12 +99,14 @@ def test_minmax_normalization_inverted():
 
 def test_sc_gap_interpretation():
     from cii_scoring import _interpret_sc_gap
-    assert _interpret_sc_gap(-0.50) == "under_converting"   # CII > SDI
+    # gap = SDI - CII. Negative → CII exceeds SDI → over-converting (UAE model);
+    # positive → SDI exceeds CII → under-converting (Brazil model).
+    assert _interpret_sc_gap(-0.50) == "over_converting"    # CII > SDI
     assert _interpret_sc_gap(0.10)  == "near_parity"
-    assert _interpret_sc_gap(1.20)  == "over_converting"    # SDI > CII
+    assert _interpret_sc_gap(1.20)  == "under_converting"   # SDI > CII
 
 
 def test_sc_gap_negative_means_cii_exceeds_sdi():
     from cii_scoring import _interpret_sc_gap
-    # UAE model: CII > SDI → gap negative → under_converting label
-    assert _interpret_sc_gap(-1.5) == "under_converting"
+    # UAE model: CII > SDI → gap negative → over_converting label
+    assert _interpret_sc_gap(-1.5) == "over_converting"

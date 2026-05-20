@@ -138,7 +138,8 @@ def test_run_discovery_pass_calls_upsert_per_query(mock_conn):
 
 def test_enrichment_updates_capacity_mw(mock_conn):
     mock_conn.cursor.return_value.__enter__.return_value.fetchall.return_value = [
-        ("US", "AWS Iowa", "Amazon", None)  # capacity_mw is NULL — needs enrichment
+        # (country_iso, facility_name, operator, capacity_mw, status, ownership_type)
+        ("US", "AWS Iowa", "Amazon", None, "operational", "foreign")
     ]
     with patch("cii_collectors.web_search") as mock_search, \
          patch("cii_collectors._enrich_facility_claude") as mock_enrich, \
@@ -160,30 +161,38 @@ def test_enrichment_updates_capacity_mw(mock_conn):
         assert call_kwargs["capacity_mw"] == 200.0
 
 
+def _validation_update_params(mock_conn):
+    """Return the params tuple of the first targeted UPDATE validation issued."""
+    cur = mock_conn.cursor.return_value.__enter__.return_value
+    update_calls = [c for c in cur.execute.call_args_list
+                    if "UPDATE cii_facilities" in c[0][0]]
+    assert update_calls, "validation should issue a targeted UPDATE"
+    # UPDATE params order: (confidence, has_estimated, benchmark_mw, run_id, ...)
+    return update_calls[0][0][1]
+
+
 def test_validation_assigns_high_confidence_for_multi_source(mock_conn):
     mock_conn.cursor.return_value.__enter__.return_value.fetchall.return_value = [
-        ("US", "AWS Iowa", "Amazon", 200.0, 2)  # source_count=2
+        # (facility_name, operator, capacity_mw, source_count)
+        ("AWS Iowa", "Amazon", 200.0, 2)  # MW known + 2 distinct sources
     ]
-    with patch("cii_collectors.log_attempt"), \
-         patch("cii_collectors.upsert_facility") as mock_upsert:
+    with patch("cii_collectors.log_attempt"):
         from cii_collectors import run_validation_pass, CONFIDENCE
         run_validation_pass(mock_conn, "run-123", "US")
-        assert mock_upsert.called
-        call_kwargs = mock_upsert.call_args[0][2]
-        assert call_kwargs["confidence_score"] == CONFIDENCE["multi_source"]
+        params = _validation_update_params(mock_conn)
+        assert params[0] == CONFIDENCE["multi_source"]   # confidence_score
 
 
 def test_validation_applies_benchmark_when_mw_missing(mock_conn):
     mock_conn.cursor.return_value.__enter__.return_value.fetchall.return_value = [
-        ("US", "Meta Iowa", "Meta", None, 0)  # capacity_mw NULL, 0 sources
+        # (facility_name, operator, capacity_mw, source_count)
+        ("Meta Iowa", "Meta", None, 0)  # capacity_mw NULL, 0 sources
     ]
-    with patch("cii_collectors.upsert_facility") as mock_upsert, \
-         patch("cii_collectors.log_attempt"), \
+    with patch("cii_collectors.log_attempt"), \
          patch("cii_collectors.upsert_gap"):
         from cii_collectors import run_validation_pass, HYPERSCALER_BENCHMARK_MW, CONFIDENCE
         run_validation_pass(mock_conn, "run-123", "US")
-        assert mock_upsert.called
-        call_kwargs = mock_upsert.call_args[0][2]
-        assert call_kwargs["capacity_mw"] == HYPERSCALER_BENCHMARK_MW["Meta"]
-        assert call_kwargs["confidence_score"] == CONFIDENCE["benchmark_est"]
-        assert call_kwargs["has_estimated_fields"] is True
+        params = _validation_update_params(mock_conn)
+        assert params[0] == CONFIDENCE["benchmark_est"]          # confidence_score
+        assert params[1] is True                                 # has_estimated_fields
+        assert params[2] == HYPERSCALER_BENCHMARK_MW["Meta"]      # benchmark_mw

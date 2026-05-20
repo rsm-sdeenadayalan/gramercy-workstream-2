@@ -1,5 +1,5 @@
 import os, json, time, re, anthropic
-from datetime import date, datetime
+from datetime import date
 from dotenv import load_dotenv
 import psycopg2
 
@@ -58,15 +58,21 @@ TRUSTED_DOMAINS = {
            "datacenterdynamics.com", "businessmirror.com.ph"],
 }
 
+# Discovery queries target where AI-relevant facilities are *found* (recall).
+# AI-relevance precision is enforced downstream by the extraction prompt
+# (Section 6: hyperscaler-operated = AI compute by default; non-platform
+# operators require explicit AI evidence) and the source deny-list — NOT by
+# narrowing these queries, which previously starved recall for countries whose
+# hyperscaler presence is reported as ordinary "cloud regions".
 DISCOVERY_QUERY_TEMPLATES = [
-    "{country} AI training data center GPU campus capacity MW {year}",
-    "{country} hyperscaler AI infrastructure investment announcement {year}",
-    "{country} Microsoft Azure AI data center GPU cluster",
-    "{country} AWS Amazon AI ML data center accelerator",
-    "{country} Google cloud TPU AI data center",
-    "{country} Meta AI supercomputer data center campus",
-    "{country} Nvidia H100 H200 Blackwell data center deployment {year}",
-    "{country} sovereign AI compute infrastructure frontier model training {year}",
+    "{country} data center capacity MW hyperscale {year}",
+    "{country} Microsoft Azure data center region",
+    "{country} AWS Amazon data center region",
+    "{country} Google cloud data center region",
+    "{country} Meta data center campus investment",
+    "{country} data center under construction announced megawatt {year}",
+    "{country} Nvidia GPU AI data center deployment",
+    "{country} hyperscaler AI compute investment announcement {year}",
 ]
 
 # Sources we explicitly reject (low signal, promotional, unverifiable MW claims).
@@ -189,11 +195,73 @@ center facilities at all, return []."""
         match = re.search(r"```[a-zA-Z]*\n?(.*?)```", text, re.DOTALL)
         text = match.group(1).strip() if match else text
         return json.loads(text)
-    except Exception:
+    except Exception as exc:
+        # Distinguish a genuine empty result from a parse/API failure —
+        # a silent [] previously hid both as "0 facilities".
+        print(f"    [{country_iso}] ⚠ facility extraction failed "
+              f"({type(exc).__name__}: {exc}) — treating as 0 facilities")
         return []
 
 
+VALID_STATUS    = {"operational", "permitted", "under_construction", "announced"}
+VALID_OWNERSHIP = {"domestic", "foreign", "joint_venture", "unknown"}
+
+
+def _normalize_date(value):
+    """Coerce a possibly-partial date to a date object, else None.
+    Claude occasionally returns year-only ('2023') or year-month ('2023-06')
+    values, which a DATE column rejects outright."""
+    if value is None or isinstance(value, date):
+        return value
+    s = str(value).strip()
+    if not s or s.lower() in ("null", "none", "unknown", "tbd", "n/a"):
+        return None
+    m = re.match(r"^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?$", s)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)),
+                    int(m.group(2)) if m.group(2) else 1,
+                    int(m.group(3)) if m.group(3) else 1)
+    except ValueError:
+        return None
+
+
+def _to_number(value):
+    """Coerce a value to float, else None. Guards DOUBLE PRECISION columns
+    against non-numeric strings — a dropped field is recoverable, a crash
+    that aborts the whole country's transaction is not."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().replace("$", "").replace(",", "").strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def upsert_facility(conn, run_id: str, f: dict) -> None:
+    # Sanitize Claude-sourced fields before they reach typed DB columns — a
+    # partial date ('2023') or non-numeric string would otherwise abort the
+    # entire country's transaction.
+    status = f.get("status") if f.get("status") in VALID_STATUS else "announced"
+    ownership = (f.get("ownership_type")
+                 if f.get("ownership_type") in VALID_OWNERSHIP else "unknown")
+    params = {
+        **f,
+        "run_id":               run_id,
+        "status":               status,
+        "ownership_type":       ownership,
+        "capacity_mw":          _to_number(f.get("capacity_mw")),
+        "investment_value_usd": _to_number(f.get("investment_value_usd")),
+        "date_announced":       _normalize_date(f.get("date_announced")),
+        "date_operational":     _normalize_date(f.get("date_operational")),
+        "source_urls":          f.get("source_urls", []),
+        "source_count":         f.get("source_count", 0),
+        "has_estimated_fields": f.get("has_estimated_fields", False),
+    }
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO cii_facilities
@@ -229,9 +297,7 @@ def upsert_facility(conn, run_id: str, f: dict) -> None:
                 source_count         = GREATEST(EXCLUDED.source_count, cii_facilities.source_count),
                 last_updated_run_id  = EXCLUDED.last_updated_run_id,
                 collected_at         = NOW()
-        """, {**f, "run_id": run_id,
-              "source_urls": f.get("source_urls", []),
-              "has_estimated_fields": f.get("has_estimated_fields", False)})
+        """, params)
     conn.commit()
 
 
@@ -505,6 +571,12 @@ def run_enrichment_pass(conn, run_id: str, country_iso: str) -> int:
 def run_validation_pass(conn, run_id: str, country_iso: str) -> int:
     """Pass 3: assign final confidence based on source agreement;
     apply hyperscaler benchmark when MW still missing.
+
+    Validation only adjusts the three fields it owns — confidence_score,
+    has_estimated_fields, and (when MW is missing) capacity_mw — via a
+    targeted UPDATE. It never reconstructs the full facility row, so it
+    cannot disturb status, ownership, dates, or other collected fields.
+    Source agreement is measured from the distinct source_urls array.
     Returns number of facilities updated."""
     updated = 0
     multi_source = 0
@@ -514,69 +586,62 @@ def run_validation_pass(conn, run_id: str, country_iso: str) -> int:
 
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT country_iso, facility_name, operator, capacity_mw, source_count,
-                   status, ownership_type
+            SELECT facility_name, operator, capacity_mw,
+                   COALESCE(array_length(source_urls, 1), 0) AS source_count
             FROM cii_facilities WHERE country_iso = %s
         """, (country_iso,))
         facilities = cur.fetchall()
 
     print(f"    [{country_iso}] validation: scoring {len(facilities)} facilities")
 
-    for fi, (c_iso, fname, operator, cap_mw, src_count,
-             existing_status, existing_ownership) in enumerate(facilities, 1):
-        update = {"country_iso": c_iso, "facility_name": fname,
-                  "operator": operator,
-                  # Preserve discovery-assigned status — validation only
-                  # adjusts confidence/MW-estimate, never flips status to
-                  # 'operational'. Doing so would erase the entire
-                  # committed-pipeline signal that SI1/SI2 depend on.
-                  "status": existing_status,
-                  "ownership_type": existing_ownership or "unknown",
-                  "is_hyperscaler": any(op in operator for op in HYPERSCALER_OPERATORS),
-                  "source_urls": [], "source_count": 0}
+    for fi, (fname, operator, cap_mw, src_count) in enumerate(facilities, 1):
+        is_hs = any(op in operator for op in HYPERSCALER_OPERATORS)
+        benchmark_mw = None  # only set when MW is missing
 
         if cap_mw is not None and src_count >= 2:
-            update["confidence_score"]     = CONFIDENCE["multi_source"]
-            update["has_estimated_fields"] = False
-            tier = "multi_source"
+            conf, has_est = CONFIDENCE["multi_source"], False
             multi_source += 1
             print(f"    [{country_iso}]   {fi}/{len(facilities)} {fname} ({operator}) "
-                  f"→ multi_source (MW={cap_mw}, sources={src_count}) "
-                  f"conf={update['confidence_score']}")
+                  f"→ multi_source (MW={cap_mw}, sources={src_count}) conf={conf}")
         elif cap_mw is not None:
-            update["confidence_score"]     = CONFIDENCE["agent_single"]
-            update["has_estimated_fields"] = False
-            tier = "agent_single"
+            conf, has_est = CONFIDENCE["agent_single"], False
             single_source += 1
             print(f"    [{country_iso}]   {fi}/{len(facilities)} {fname} ({operator}) "
-                  f"→ agent_single (MW={cap_mw}, sources={src_count}) "
-                  f"conf={update['confidence_score']}")
+                  f"→ agent_single (MW={cap_mw}, sources={src_count}) conf={conf}")
         else:
-            # Apply benchmark estimate
-            benchmark = next(
+            benchmark_mw = next(
                 (v for op, v in HYPERSCALER_BENCHMARK_MW.items() if op in operator),
                 HYPERSCALER_BENCHMARK_MW["default"]
             )
-            update["capacity_mw"]          = benchmark
-            update["confidence_score"]     = CONFIDENCE["benchmark_est"]
-            update["has_estimated_fields"] = True
-            tier = "benchmark_est"
+            conf, has_est = CONFIDENCE["benchmark_est"], True
             benchmark_est += 1
-            severity = "medium" if update["is_hyperscaler"] else "low"
+            severity = "medium" if is_hs else "low"
             print(f"    [{country_iso}]   {fi}/{len(facilities)} {fname} ({operator}) "
-                  f"→ benchmark_est (MW missing → assigned {benchmark} MW) "
-                  f"conf={update['confidence_score']} | gap severity={severity}")
-            upsert_gap(conn, c_iso, "capacity_mw", fname,
+                  f"→ benchmark_est (MW missing → assigned {benchmark_mw} MW) "
+                  f"conf={conf} | gap severity={severity}")
+            upsert_gap(conn, country_iso, "capacity_mw", fname,
                        "field_gap", "capacity_mw not found after enrichment",
                        severity)
             gaps_created += 1
 
-        upsert_facility(conn, run_id, update)
-        log_attempt(conn, run_id, c_iso, fname, "validation",
-                    None, None, "success", update["confidence_score"], 0)
+        # Targeted update: only the fields validation owns. COALESCE keeps an
+        # already-known capacity_mw and fills it only when missing.
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE cii_facilities
+                SET confidence_score     = %s,
+                    has_estimated_fields = %s,
+                    capacity_mw          = COALESCE(capacity_mw, %s),
+                    last_updated_run_id  = %s,
+                    collected_at         = NOW()
+                WHERE country_iso = %s AND facility_name = %s AND operator = %s
+            """, (conf, has_est, benchmark_mw, run_id,
+                  country_iso, fname, operator))
+        conn.commit()
+        log_attempt(conn, run_id, country_iso, fname, "validation",
+                    None, None, "success", conf, 0)
         updated += 1
 
-    conn.commit()
     print(f"    [{country_iso}] validation pass complete: {updated} facilities updated "
           f"| {multi_source} multi_source, {single_source} single_source, "
           f"{benchmark_est} benchmark_est | {gaps_created} new gap rows")

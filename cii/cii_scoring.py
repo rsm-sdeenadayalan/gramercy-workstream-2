@@ -1,7 +1,7 @@
 import calendar
 import os
 import psycopg2
-from datetime import date
+from datetime import date, timedelta
 from dotenv import load_dotenv
 from cii_collectors import COUNTRIES
 from cii_si3_collectors import upsert_raw_metric
@@ -30,21 +30,36 @@ def _quarter_end(d: date) -> date:
 
 def _compute_si2_snapshot(conn, country_iso: str, quarter: str,
                            quarter_end: date) -> dict:
-    """Aggregate facilities into a quarterly snapshot; compute QoQ rates."""
+    """Aggregate facilities into a quarterly snapshot, as of `quarter_end`.
+
+    Installed / committed capacity is measured *as of* the quarter-end date
+    using facility dates: a facility is installed once date_operational has
+    passed, committed once date_announced has passed. Facilities with no
+    documented date are treated as pre-existing baseline (counted in every
+    quarter), so QoQ growth is driven only by dated facilities."""
     with conn.cursor() as cur:
-        # Current quarter aggregates
+        # As-of-quarter-end aggregates (D = quarter_end)
         q = (quarter_end.month - 1) // 3
         q_start = date(quarter_end.year, [1, 4, 7, 10][q], 1)
         cur.execute("""
             SELECT
-                COALESCE(SUM(CASE WHEN status='operational' THEN capacity_mw ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status!='operational' THEN capacity_mw ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status='operational'
+                                   AND (date_operational IS NULL
+                                        OR date_operational <= %(d)s)
+                                  THEN capacity_mw ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status!='operational'
+                                   AND (date_announced IS NULL
+                                        OR date_announced <= %(d)s)
+                                  THEN capacity_mw ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN status!='operational' AND is_hyperscaler
+                                   AND (date_announced IS NULL
+                                        OR date_announced <= %(d)s)
                                   THEN investment_value_usd ELSE 0 END), 0),
                 COUNT(CASE WHEN is_hyperscaler AND status!='operational'
-                           AND date_announced BETWEEN %s AND %s THEN 1 END)
-            FROM cii_facilities WHERE country_iso = %s
-        """, (q_start, quarter_end, country_iso))
+                           AND date_announced BETWEEN %(q_start)s AND %(d)s
+                           THEN 1 END)
+            FROM cii_facilities WHERE country_iso = %(country)s
+        """, {"d": quarter_end, "q_start": q_start, "country": country_iso})
         row = cur.fetchall()
         if not row or not row[0]:
             installed, committed, committed_usd, new_hs = 0.0, 0.0, 0.0, 0
@@ -102,21 +117,75 @@ def _compute_si2_snapshot(conn, country_iso: str, quarter: str,
     }
 
 
-def compute_si2_all_countries(conn, run_id: str) -> None:
-    """Compute SI2 quarterly snapshot for all 6 countries and write to DB."""
-    today = date.today()
-    quarter = _quarter_label(today)
-    q_end   = _quarter_end(today)
+def _write_snapshot(conn, snap: dict, run_id: str) -> None:
+    """Upsert one quarterly snapshot row into cii_quarterly_snapshots."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO cii_quarterly_snapshots
+                (country_iso, quarter, quarter_end_date, installed_mw, committed_mw,
+                 committed_usd, pipeline_multiplier, hyperscaler_commitments_count,
+                 qoq_installed_growth_rate, qoq_committed_mw_growth_rate,
+                 qoq_committed_usd_growth_rate, national_grid_mw, grid_strain_ratio,
+                 run_id)
+            VALUES (%(country_iso)s,%(quarter)s,%(quarter_end_date)s,%(installed_mw)s,
+                    %(committed_mw)s,%(committed_usd)s,%(pipeline_multiplier)s,
+                    %(hyperscaler_commitments_count)s,%(qoq_installed_growth_rate)s,
+                    %(qoq_committed_mw_growth_rate)s,%(qoq_committed_usd_growth_rate)s,
+                    %(national_grid_mw)s,%(grid_strain_ratio)s,%(run_id)s)
+            ON CONFLICT (country_iso, quarter) DO UPDATE SET
+                installed_mw                    = EXCLUDED.installed_mw,
+                committed_mw                    = EXCLUDED.committed_mw,
+                committed_usd                   = EXCLUDED.committed_usd,
+                pipeline_multiplier             = EXCLUDED.pipeline_multiplier,
+                hyperscaler_commitments_count   = EXCLUDED.hyperscaler_commitments_count,
+                qoq_installed_growth_rate       = EXCLUDED.qoq_installed_growth_rate,
+                qoq_committed_mw_growth_rate    = EXCLUDED.qoq_committed_mw_growth_rate,
+                qoq_committed_usd_growth_rate   = EXCLUDED.qoq_committed_usd_growth_rate,
+                national_grid_mw                = EXCLUDED.national_grid_mw,
+                grid_strain_ratio               = EXCLUDED.grid_strain_ratio,
+                run_id                          = EXCLUDED.run_id,
+                computed_at                     = NOW()
+        """, {**snap, "run_id": run_id})
+    conn.commit()
 
-    print(f"  [SI2] computing {quarter} snapshot (quarter_end={q_end}) "
-          f"for {len(COUNTRIES)} countries")
+
+def compute_si2_all_countries(conn, run_id: str) -> None:
+    """Compute SI2 quarterly snapshots for all 6 countries and write to DB.
+
+    The immediately-preceding quarter is reconstructed date-aware from
+    facility commissioning/announcement dates so QoQ growth has a baseline
+    to compare against. Undated facilities are treated as pre-existing (they
+    appear in both quarters and contribute 0 growth); growth is therefore
+    driven only by facilities with documented dates. Only the current
+    quarter's metrics are written to cii_raw_metrics for scoring — the
+    previous quarter exists purely as the QoQ baseline."""
+    today = date.today()
+    cur_quarter = _quarter_label(today)
+    cur_q_end   = _quarter_end(today)
+
+    # Previous quarter end = day before the current quarter started.
+    q = (cur_q_end.month - 1) // 3
+    cur_q_start  = date(cur_q_end.year, [1, 4, 7, 10][q], 1)
+    prev_q_end   = cur_q_start - timedelta(days=1)
+    prev_quarter = _quarter_label(prev_q_end)
+
+    print(f"  [SI2] computing {prev_quarter} (reconstructed baseline) + "
+          f"{cur_quarter} snapshots for {len(COUNTRIES)} countries")
 
     for country_iso in COUNTRIES:
-        print(f"  [SI2:{country_iso}] aggregating facilities → snapshot")
-        snap = _compute_si2_snapshot(conn, country_iso, quarter, q_end)
-        print(f"  [SI2:{country_iso}]   installed_mw={snap['installed_mw']} "
-              f"committed_mw={snap['committed_mw']} "
-              f"committed_usd={snap['committed_usd']}")
+        # 1. Previous-quarter baseline first, so the current-quarter QoQ
+        #    lookup finds something to compare against.
+        prev_snap = _compute_si2_snapshot(conn, country_iso, prev_quarter, prev_q_end)
+        _write_snapshot(conn, prev_snap, run_id)
+        print(f"  [SI2:{country_iso}] {prev_quarter} baseline → "
+              f"installed={prev_snap['installed_mw']} "
+              f"committed={prev_snap['committed_mw']}")
+
+        # 2. Current quarter.
+        snap = _compute_si2_snapshot(conn, country_iso, cur_quarter, cur_q_end)
+        _write_snapshot(conn, snap, run_id)
+        print(f"  [SI2:{country_iso}] {cur_quarter} → installed={snap['installed_mw']} "
+              f"committed={snap['committed_mw']} committed_usd={snap['committed_usd']}")
         print(f"  [SI2:{country_iso}]   pipeline_multiplier={snap['pipeline_multiplier']} "
               f"new_hyperscaler_commitments={snap['hyperscaler_commitments_count']}")
         print(f"  [SI2:{country_iso}]   QoQ installed={snap['qoq_installed_growth_rate']} "
@@ -124,36 +193,8 @@ def compute_si2_all_countries(conn, run_id: str) -> None:
               f"committed_usd={snap['qoq_committed_usd_growth_rate']}")
         print(f"  [SI2:{country_iso}]   grid_mw={snap['national_grid_mw']} "
               f"grid_strain_ratio={snap['grid_strain_ratio']}")
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO cii_quarterly_snapshots
-                    (country_iso, quarter, quarter_end_date, installed_mw, committed_mw,
-                     committed_usd, pipeline_multiplier, hyperscaler_commitments_count,
-                     qoq_installed_growth_rate, qoq_committed_mw_growth_rate,
-                     qoq_committed_usd_growth_rate, national_grid_mw, grid_strain_ratio,
-                     run_id)
-                VALUES (%(country_iso)s,%(quarter)s,%(quarter_end_date)s,%(installed_mw)s,
-                        %(committed_mw)s,%(committed_usd)s,%(pipeline_multiplier)s,
-                        %(hyperscaler_commitments_count)s,%(qoq_installed_growth_rate)s,
-                        %(qoq_committed_mw_growth_rate)s,%(qoq_committed_usd_growth_rate)s,
-                        %(national_grid_mw)s,%(grid_strain_ratio)s,%(run_id)s)
-                ON CONFLICT (country_iso, quarter) DO UPDATE SET
-                    installed_mw                    = EXCLUDED.installed_mw,
-                    committed_mw                    = EXCLUDED.committed_mw,
-                    committed_usd                   = EXCLUDED.committed_usd,
-                    pipeline_multiplier             = EXCLUDED.pipeline_multiplier,
-                    hyperscaler_commitments_count   = EXCLUDED.hyperscaler_commitments_count,
-                    qoq_installed_growth_rate       = EXCLUDED.qoq_installed_growth_rate,
-                    qoq_committed_mw_growth_rate    = EXCLUDED.qoq_committed_mw_growth_rate,
-                    qoq_committed_usd_growth_rate   = EXCLUDED.qoq_committed_usd_growth_rate,
-                    national_grid_mw                = EXCLUDED.national_grid_mw,
-                    grid_strain_ratio               = EXCLUDED.grid_strain_ratio,
-                    run_id                          = EXCLUDED.run_id,
-                    computed_at                     = NOW()
-            """, {**snap, "run_id": run_id})
-        conn.commit()
 
-        # Write SI1 + SI2 metrics to cii_raw_metrics for scoring
+        # 3. Raw metrics — current quarter only (these feed scoring).
         si1_metrics = {
             "installed_capacity_mw": (snap["installed_mw"],       "MW",    0.85),
             "committed_pipeline_mw": (snap["committed_mw"],       "MW",    0.80),

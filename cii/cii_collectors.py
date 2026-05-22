@@ -163,6 +163,15 @@ INCLUDE:
   - Frontier model training sites or sovereign AI compute projects
   - Large hyperscale data center campuses announced 2023 or later
 
+BROAD HYPERSCALER CAPTURE: If the sources indicate a major cloud/AI platform
+operates, is building, or has announced data-center or cloud-region
+infrastructure in {country_name} — even described only generally ("AWS has a
+cloud region in {country_name}", "Microsoft operates data centers in
+{country_name}") with no specific campus or capacity named — RECORD IT as a
+facility. Name it descriptively, e.g. "AWS Cloud Region — {country_name}".
+Leave capacity_mw, dates, and investment null when not stated. Never skip a
+hyperscaler's in-country presence for lack of specifics.
+
 EXCLUDE only clearly non-AI infrastructure:
   - Pure CDN / edge POPs, telecom switching, carrier hotels
   - Crypto-mining facilities, disaster-recovery-only sites
@@ -180,6 +189,12 @@ Return a JSON array. Each item MUST have these exact keys:
                source if it mentions AI/GPU/training; otherwise state that the
                operator is a major AI/cloud platform. Use null only if the
                facility is genuinely not tied to AI or any cloud platform.)
+
+Extract ONLY from the sources below — do not add facilities from prior
+knowledge. Every facility must be supported by the source text.
+
+Sources:
+{content_block}
 
 Return ONLY the JSON array. No explanation. If the sources contain no data
 center facilities at all, return []."""
@@ -244,8 +259,8 @@ def _to_number(value):
 
 def upsert_facility(conn, run_id: str, f: dict) -> None:
     # Sanitize Claude-sourced fields before they reach typed DB columns — a
-    # partial date ('2023') or non-numeric string would otherwise abort the
-    # entire country's transaction.
+    # partial date, a non-numeric string, an over-length text value, or an
+    # invalid enum would otherwise abort the entire country's transaction.
     status = f.get("status") if f.get("status") in VALID_STATUS else "announced"
     ownership = (f.get("ownership_type")
                  if f.get("ownership_type") in VALID_OWNERSHIP else "unknown")
@@ -254,6 +269,12 @@ def upsert_facility(conn, run_id: str, f: dict) -> None:
         "run_id":               run_id,
         "status":               status,
         "ownership_type":       ownership,
+        "facility_name":        str(f.get("facility_name") or "")[:500],
+        "operator":             str(f.get("operator") or "")[:200],
+        "energy_source":        (str(f["energy_source"])[:200]
+                                 if f.get("energy_source") else None),
+        "chip_type_if_known":   (str(f["chip_type_if_known"])[:200]
+                                 if f.get("chip_type_if_known") else None),
         "capacity_mw":          _to_number(f.get("capacity_mw")),
         "investment_value_usd": _to_number(f.get("investment_value_usd")),
         "date_announced":       _normalize_date(f.get("date_announced")),

@@ -207,6 +207,13 @@ are included as AI compute by default — the operator's identity is itself the 
 The platform set used by the collector is: Microsoft / Azure, Amazon / AWS, Google, Meta,
 Oracle, Apple, Alibaba, Tencent, Huawei, Nvidia, CoreWeave, OpenAI, xAI, Anthropic.
 
+Extending this, the index captures hyperscaler data-center presence **broadly**: where
+sources establish that a major cloud/AI platform operates data-center or cloud-region
+infrastructure in a country — even without naming a specific campus or stating capacity —
+that presence is recorded as a facility (e.g. "AWS Cloud Region — Brazil"). This ensures
+every country's hyperscaler footprint is represented, not only those with high-profile
+named AI campuses in the press.
+
 ### 6.4 The evidence gate for ambiguous operators
 
 For **non-platform operators** — regional colocation providers, telecom carriers, generic

@@ -13,7 +13,7 @@ SDI_DB_CONFIG = {
     "port":     int(os.environ.get("POSTGRES_PORT", 5432)),
     "user":     os.environ.get("POSTGRES_USER", ""),
     "password": os.environ.get("POSTGRES_PASSWORD", ""),
-    "dbname":   "csi_scores",
+    "dbname":   "gramercy_workstream1",
 }
 
 
